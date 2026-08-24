@@ -1,6 +1,10 @@
-# navigateur -- shell integration.  Source this from ~/.zshrc:
+# navigateur -- shell integration.  `install.sh` at the repo root puts the right
+# absolute path to this file into your .zshrc; the line it writes is:
 #
-#     source ~/Desktop/navigateur/src/nav.zsh
+#     source "/wherever/you/cloned/navigateur/src/nav.zsh"
+#
+# No path in here needs editing: NAV_HOME below resolves it from the file zsh
+# is sourcing (%x), so the repo can live anywhere and be moved afterwards.
 #
 # It MUST be sourced, not executed: nav() has to be a function so that its `cd`
 # happens in *your* shell.  A script runs in a subshell and its cd dies with it.
@@ -16,15 +20,18 @@ NAV_HOME=${${(%):-%x}:A:h}
 # delivery rather than breaking.
 zmodload zsh/system 2>/dev/null && _NAV_HAVE_SYSOPEN=1 || _NAV_HAVE_SYSOPEN=
 
-# /dev/ttys003 -> ttys003.  nav.py's os.ttyname() basename must produce the
+# The path under /dev with `/` mapped to `-`: /dev/ttys003 -> ttys003 (macOS,
+# unchanged), /dev/pts/3 -> pts-3 (Linux).  nav.py's self_tty() must produce the
 # identical string: that one string is the FIFO stem, the self-exclusion key in
-# publish(), *and* the role-file name.  $TTY is only set in interactive shells,
-# hence the fallback.
+# publish(), *and* the role-file name.  Not ${t:t} -- a Linux basename collapses
+# /dev/pts/3 to `3`, which collides with the console /dev/tty3.  $TTY is only set
+# in interactive shells, hence the fallback.
 _nav_tty() {
   local t=$TTY
   [[ -n $t ]] || t=$(tty 2>/dev/null)
   [[ $t == /dev/* ]] || return 1   # `tty` prints "not a tty" on stdout, so the
-  print -r -- ${t:t}               # /dev/ prefix is the only safe check
+  t=${t#/dev/}                     # /dev/ prefix is the only safe check
+  print -r -- ${t//\//-}
 }
 
 # Cached: $(...) forks, and the prompt hook must stay free for terminals that
@@ -71,6 +78,23 @@ _nav_role_write() {              # $1 tty  $2 leader|follower|solo
   return 0
 }
 
+# The leading tty, or empty.  This globs roles/, so it belongs to the verb paths
+# only -- _nav_precmd reconciles at every prompt and must never stat the world.
+# $1 is a tty to skip, and skipping self is the whole point at the follow guard:
+# a leader asking "is there someone to follow?" must not find *itself*, pass,
+# and demote -- that would leave nobody leading, which is exactly the state the
+# refusal exists to prevent.  Empty $1 skips nothing, which is what `status`
+# wants.
+_nav_find_leader() {             # $1 tty to exclude (may be empty) -> REPLY
+  local f
+  REPLY=
+  for f in $NAV_STATE/roles/*(N); do
+    [[ -n $1 && ${f:t} == $1 ]] && continue
+    [[ $(<$f) == leader* ]] && { REPLY=${f:t}; return 0 }
+  done
+  return 0
+}
+
 # A role file for our tty that *this* shell never asked for is a leftover from
 # a window that was killed before zshexit could clean up -- and tty names get
 # reused freely.  An empty _NAV_ROLE is the proof that it was not us.  Called
@@ -107,6 +131,10 @@ _nav_publish() {                 # $1 tty (self, excluded)  $2 dir
   local me=$1 dest=$2 f fd
   mkdir -p -- $NAV_STATE 2>/dev/null || return 1
   print -r -- $dest >| $NAV_STATE/cwd 2>/dev/null
+  # A publish is an event, not a value.  Without this stamp a leader
+  # re-selecting the directory a follower has since left is byte-identical to
+  # the stale file that follower already declined, and _NAV_SEEN swallows it.
+  print -r -- ${RANDOM}${RANDOM} >| $NAV_STATE/gen 2>/dev/null
   [[ -n $_NAV_HAVE_SYSOPEN ]] || return 0    # lazy delivery only; still correct
   for f in $NAV_STATE/sub/*.fifo(N); do
     [[ ${${f:t}:r} == $me ]] && continue     # never fight our own shell's cd
@@ -123,15 +151,24 @@ _nav_publish() {                 # $1 tty (self, excluded)  $2 dir
 
 # ----------------------------------------------------------------- following
 
+# The identity of the last broadcast: its generation stamp and its directory.
+# _NAV_SEEN holds one of these, never a bare path.
+_nav_msg() {
+  local gen=
+  [[ -r $NAV_STATE/gen ]] && gen=$(<$NAV_STATE/gen)
+  print -r -- "$gen:$1"
+}
+
 # Live path: zle -F wakes the line editor while the shell sits idle at a
 # prompt.  An idle zsh is blocked reading its TTY and cannot otherwise be made
 # to run anything from outside -- this is the only way in.
 _nav_reader() {
   local dest
   IFS= read -r -u $1 dest || { zle -F $1; return }
-  _NAV_SEEN=$dest          # record before acting: a message we consumed but
-  if [[ -d $dest && $dest != $PWD ]]; then   # chose not to act on must not be
-    builtin cd -- "$dest"                    # replayed by _nav_precmd later
+  _NAV_SEEN=$(_nav_msg $dest)   # record before acting: a message we consumed
+                                # but chose not to act on must not be
+  if [[ -d $dest && $dest != $PWD ]]; then   # replayed by _nav_precmd later
+    builtin cd -- "$dest"
     zle reset-prompt
   fi
 }
@@ -142,7 +179,8 @@ _nav_follow_start() {
   local fifo=$NAV_STATE/sub/$_NAV_TTY.fifo
   mkdir -p -- $NAV_STATE/sub 2>/dev/null || return 1
   _NAV_FOLLOWING=1
-  _NAV_SEEN=$PWD
+  _NAV_SEEN=            # nothing seen yet: a window that starts following
+                        # mid-browse is owed the stored cwd at its next prompt
   # Try the live path; fall back to the precmd path rather than failing.  Both
   # read the same state, so degrading costs only immediacy.
   if [[ -o interactive ]]; then
@@ -187,8 +225,9 @@ _nav_precmd() {
       # deliberately cd somewhere yourself.
       [[ -r $NAV_STATE/cwd ]] || return 0
       local dest; dest=$(<$NAV_STATE/cwd)
-      [[ $dest == $_NAV_SEEN ]] && return 0
-      _NAV_SEEN=$dest
+      local msg; msg=$(_nav_msg $dest)
+      [[ $msg == $_NAV_SEEN ]] && return 0
+      _NAV_SEEN=$msg
       [[ -d $dest && $dest != $PWD ]] && builtin cd -- "$dest"
       ;;
   esac
@@ -217,6 +256,17 @@ _nav_announce() {
 }
 
 _nav_set_role() {
+  # Refuse to follow nothing.  Guarded here and not in _nav_cmd's `follow`
+  # branch because three paths promote to follower (`follow`, `follow on`,
+  # `follow toggle`) and this is the one chokepoint all of them pass through --
+  # a fourth added later is covered for free.  The role file is left untouched.
+  if [[ $1 == follower ]]; then
+    local REPLY; _nav_find_leader $_NAV_TTY
+    if [[ -z $REPLY ]]; then
+      print -r -- 'navigateur: no leader — run `n leader` in the window that should lead' >&2
+      return 2
+    fi
+  fi
   _nav_role_write $_NAV_TTY $1 || {
     print -r -- "navigateur: cannot write $NAV_STATE/roles/$_NAV_TTY" >&2; return 1
   }
@@ -226,11 +276,10 @@ _nav_set_role() {
 }
 
 _nav_status() {
-  local f n=0 leader=
+  local f n=0 leader= REPLY
   for f in $NAV_STATE/sub/*.fifo(N); do (( n++ )); done
-  for f in $NAV_STATE/roles/*(N); do
-    [[ $(<$f) == leader* ]] && leader=${f:t}
-  done
+  _nav_find_leader                 # no exclusion: status reports what is there
+  leader=$REPLY
   _nav_announce
   if [[ -z $leader ]]; then
     print -r -- "  leader: none"
@@ -251,10 +300,10 @@ _nav_cmd() {
   _nav_drop_stale_role
   _nav_reconcile
   case $1 in
-    lead)   _nav_set_role leader ;;
+    lead|leader) _nav_set_role leader ;;
     solo)   _nav_set_role solo ;;
     status) _nav_status ;;
-    follow)
+    follow|follower)
       case ${2:-on} in
         on)     _nav_set_role follower ;;
         off)    _nav_set_role solo ;;
@@ -268,7 +317,11 @@ _nav_cmd() {
 # --------------------------------------------------------------- the browser
 
 nav() {
-  if [[ $1 == (lead|follow|solo|status) ]]; then
+  # `leader`/`follower` are aliases, not renames: `lead`/`follow` are documented
+  # and keep working.  This pattern has to learn the new names too -- miss it and
+  # `n leader` falls through to the browser, where nav.py resolves "leader" as a
+  # *path*, fails is_dir(), takes .parent, and silently opens $PWD instead.
+  if [[ $1 == (lead|leader|follow|follower|solo|status) ]]; then
     local verb=$1; shift
     _nav_cmd $verb "$@"
     return

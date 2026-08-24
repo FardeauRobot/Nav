@@ -15,14 +15,41 @@ lead and drag your *other* terminals along with it.
   hjkl move · F lead · f follow · q quit
 ```
 
-Stdlib-only Python 3 + zsh. No dependencies, no build step.
+Stdlib-only Python 3 + zsh. No dependencies, no build step. macOS and Linux,
+including over ssh.
 
 ## Install
 
 ```sh
-echo 'source ~/Desktop/navigateur/src/nav.zsh' >> ~/.zshrc
+git clone https://github.com/FardeauRobot/Nav.git ~/navigateur
+cd ~/navigateur && ./install.sh          # or: sh install.sh
 exec zsh
 ```
+
+(`git@github.com:FardeauRobot/Nav.git` if you have ssh keys set up.)
+
+`install.sh` copies nothing and builds nothing — `src/nav.zsh` works out its own
+location when it is sourced, so installing is one line appended to your
+`.zshrc` (`$ZDOTDIR/.zshrc` if you set that). Re-running it is a no-op, and
+`./install.sh --uninstall` takes the line back out. `--dry-run` shows you the
+line without writing it. Your colours and state in `~/.navigateur/` are never
+touched, including by `--uninstall`.
+
+It refuses to install without **zsh** or **python3**, and warns — without
+stopping — on a python3 older than 3.11, where `config.toml` is ignored and the
+built-in colours apply.
+
+On Fedora (and other distros that ship bash as the login shell), that first
+check is the one you'll hit; zsh is a hard requirement, not a preference:
+
+```sh
+sudo dnf install zsh          # python3 is already there, and 3.11+ so tomllib is too
+chsh -s /bin/zsh              # optional; or just run `zsh` when you want the browser
+```
+
+Live following needs `zle -F`, which only zsh has: there is no way to wake an
+idle bash from outside, so a bash port would quietly lose the feature rather
+than fail loudly. That is why there isn't one.
 
 Then type **`navigate`** in any terminal to open it, and **`q`** to quit.
 (`nav` and `n` are shorter aliases for the same thing.)
@@ -44,7 +71,7 @@ the function cds there afterwards — the same trick `ranger` and `lf` use.
 | `w` | open this folder in a **new terminal window** |
 | `t` | open this folder in a **new terminal tab** |
 | `F` | make this window the **leader** — the others follow where it goes |
-| `f` | make this window a **follower** of the leader |
+| `f` | make this window a **follower** of the leader — refused if nobody is leading |
 | `.` | show/hide dotfiles |
 | `g` / `G` | top / bottom |
 | `↵` | quit **and** cd your shell here |
@@ -62,8 +89,24 @@ drive is read from `$TERM_PROGRAM`:
 | Terminal.app | ✓ AppleScript `do script` | ✗ — has no scriptable new tab |
 | anything else | ✗ | ✗ |
 
-Unsupported combinations say so on the hint line and do nothing else. Like `o`
-and `O`, this is macOS-only.
+On Linux there is no `$TERM_PROGRAM`, so the first installed terminal wins
+instead — `$NAV_TERMINAL` if you set it, else gnome-terminal, konsole,
+xfce4-terminal, kitty, alacritty, foot in that order:
+
+| terminal | `w` | `t` |
+|---|---|---|
+| gnome-terminal, konsole, xfce4-terminal | ✓ | ✓ |
+| kitty, alacritty, foot | ✓ | ✗ — no new-tab flag |
+| `$NAV_TERMINAL` (anything else) | ✓ launched with this directory as its cwd | ✗ |
+
+Unsupported combinations say so on the hint line and do nothing else.
+
+**All four of `o`, `O`, `w` and `t` need a desktop.** On Linux they check
+`$DISPLAY`/`$WAYLAND_DISPLAY` and say `no display` when there is none, which is
+the usual case over ssh to a server — the browser itself is unaffected. `o` uses
+`xdg-open`; `O` uses the freedesktop `FileManager1.ShowItems` D-Bus call (Nautilus,
+Dolphin, Thunar), falling back to opening the parent folder without the selection
+when `gdbus` is missing.
 
 The two Warp deep links are verified against Warp 0.2026.08.19 rather than
 assumed: they log `root_view:add_session_at_path` and
@@ -81,12 +124,26 @@ the browser, or from a prompt — the two are the same thing:
 
 | | in `navigate` | at a prompt |
 |---|---|---|
-| **lead** — this window is the master | `F` | `navigate lead` |
-| **follow** — this window tracks the leader | `f` | `navigate follow` |
+| **lead** — this window is the master | `F` | `navigate leader` (or `lead`) |
+| **follow** — this window tracks the leader | `f` | `navigate follow` (or `follower`) |
 | **neither** | `F` / `f` again | `navigate solo` |
 
 `navigate status` says which role this window holds and who the leader is.
 `navigate follow on|off|toggle|status` still works and means the same thing.
+
+**Following needs somebody to follow.** With no leader anywhere, `navigate
+follow` prints
+
+```
+navigateur: no leader — run `n leader` in the window that should lead
+```
+
+and changes nothing, exiting 2 — rather than leaving you a follower that will
+never move. `f` in the browser says the same in its status line. Set a leader
+first; the order is `leader` in one window, then `follow` in the others. A
+window that is *itself* the leader gets the same refusal if it types `follow`:
+it does not count as its own leader, so the refusal cannot leave you with nobody
+leading.
 
 There is **exactly one leader**. Pressing `F` in a second window takes the lead
 away from the first, which notices at its next prompt and goes solo — you never
@@ -128,6 +185,10 @@ two windows side by side and browse in the leader to see it.
   its keyboard and this is the only way to wake it from outside.
 - **lazy** — it catches up the next time you press Enter. Automatic fallback
   when `zle` isn't available; costs immediacy and nothing else.
+
+Following is **per machine**. The shared state is a directory on disk, so two
+ssh sessions into the same Fedora box follow each other, but a terminal on your
+Mac can never lead one on that box — different filesystems, no shared seam.
 
 Which one you get in **Warp specifically is unverified** — `zle -F` needs a live
 interactive prompt, so it can't be tested from a script. Run `navigate follow` in a
@@ -189,6 +250,7 @@ than failing — a typo shouldn't cost you the browser you'd use to fix it.
 
 | path | |
 |---|---|
+| `install.sh` | writes the `source` line into your `.zshrc`; `--uninstall` removes it |
 | `src/nav.py` | the TUI — raw ANSI, never writes data to stdout |
 | `src/nav.zsh` | the `nav()` function (`navigate`/`n` alias it), follow subscription, hooks |
 | `~/.navigateur/` | `config.toml`, `cwd`, `roles/<tty>`, `sub/<tty>.fifo` |
@@ -199,4 +261,4 @@ already has entries there and clobbering the array breaks the terminal.
 ## Not in this first pass
 
 Fuzzy search, file operations (rename/delete/move), bookmarks, git-status
-decorations, and non-macOS `open` equivalents.
+decorations, a bash integration, and following across machines.

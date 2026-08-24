@@ -22,6 +22,7 @@ import subprocess
 import sys
 import shlex
 import termios
+import time
 import tty
 from pathlib import Path
 from urllib.parse import quote
@@ -35,6 +36,7 @@ STATE = Path(os.environ.get("NAV_STATE", str(Path.home() / ".navigateur")))
 SUB = STATE / "sub"
 ROLES = STATE / "roles"
 CWD_FILE = STATE / "cwd"
+GEN_FILE = STATE / "gen"
 CONFIG = STATE / "config.toml"
 
 MAX_DEPTH = 40
@@ -149,17 +151,57 @@ def home_short(p: Path) -> str:
     return "~" + s[len(home):] if s == home or s.startswith(home + os.sep) else s
 
 
+# ------------------------------------------------------------------- the desktop
+
+IS_MAC = sys.platform == "darwin"
+
+# Terminals that can be told where to start, and how. A `None` tab command means
+# that terminal has no scriptable new tab -- the Terminal.app case, on Linux.
+LINUX_TERMINALS = {
+    "gnome-terminal": (["--working-directory", "{d}"], ["--tab", "--working-directory", "{d}"]),
+    "konsole":        (["--workdir", "{d}"],           ["--new-tab", "--workdir", "{d}"]),
+    "xfce4-terminal": (["--working-directory", "{d}"], ["--tab", "--working-directory", "{d}"]),
+    "kitty":          (["--directory", "{d}"],         None),
+    "alacritty":      (["--working-directory", "{d}"], None),
+    "foot":           (["-D", "{d}"],                  None),
+}
+
+
+def has_display() -> bool:
+    """The discriminator for `o`/`O`/`w`/`t` on Linux. Deliberately not
+    $SSH_CONNECTION: X-forwarding gives an ssh session a usable display, and a
+    local session that lost its display has nothing to open onto either. What
+    matters is whether there is a desktop to talk to, not how we got here."""
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def launch_detached(args: list[str], cwd: str | None = None) -> None:
+    """Popen, not run(): kitty, alacritty and foot do not fork, so run() would
+    block the browser until the new window is closed. start_new_session keeps
+    the child off our process group, so ctrl-c here never reaches it."""
+    subprocess.Popen(args, cwd=cwd, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                     start_new_session=True)
+
+
 # ------------------------------------------------------------------------- follow
 
 
 def self_tty() -> str | None:
-    """Basename of this terminal's tty. MUST match zsh's ${TTY:t} exactly or
-    self-exclusion silently fails and the driving terminal fights itself."""
+    """This terminal's tty name: the path under /dev with `/` mapped to `-`.
+    MUST match _nav_tty() in nav.zsh byte for byte or self-exclusion silently
+    fails and the driving terminal fights itself.
+
+    Not a basename: Linux `/dev/pts/3` would collapse to `3`, which collides
+    with the console `/dev/tty3` and makes a garbage FIFO stem. macOS
+    `/dev/ttys003` has no slash left to map, so it is unchanged by this rule
+    and existing state keeps working."""
     for fd in (0, 1, 2):
         try:
-            return os.path.basename(os.ttyname(fd))
+            name = os.ttyname(fd)
         except OSError:
             continue
+        return name.removeprefix("/dev/").replace("/", "-") or None
     return None
 
 
@@ -178,6 +220,28 @@ def read_role(me: str | None) -> str:
     except OSError:
         return "solo"
     return value if value in ("leader", "follower") else "solo"
+
+
+def find_leader(me: str | None) -> str | None:
+    """The leading tty, or None. The mirror of nav.zsh's _nav_find_leader.
+
+    `me` is excluded: a window asking "is there a leader for me to follow?" must
+    not find itself, succeed, and demote -- that leaves nobody leading, which is
+    the state the refusal exists to prevent. This globs ROLES, so it belongs on
+    the key paths only, never in the redraw loop."""
+    try:
+        entries = sorted(ROLES.iterdir())
+    except OSError:
+        return None
+    for q in entries:
+        if q.name == me:
+            continue
+        try:
+            if q.read_text().strip() == "leader":
+                return q.name
+        except OSError:
+            pass
+    return None
 
 
 def write_role(me: str | None, role: str) -> bool:
@@ -217,12 +281,26 @@ def read_cwd() -> str | None:
         return None
 
 
+def read_msg(dest: str) -> str:
+    """The identity of the last broadcast: its generation stamp and its
+    directory. A publish is an event, not a value -- a leader re-selecting the
+    directory a follower has since left writes a byte-identical `cwd`, and
+    without the stamp that is indistinguishable from the stale file the
+    follower already declined. `self.seen` holds one of these, never a path."""
+    try:
+        gen = GEN_FILE.read_text().strip()
+    except OSError:
+        gen = ""
+    return gen + ":" + dest
+
+
 def publish(path: Path, me: str | None) -> None:
     """Broadcast a directory to every subscribed terminal."""
     payload = (str(path) + "\n").encode()
     try:
         STATE.mkdir(parents=True, exist_ok=True)
         CWD_FILE.write_text(str(path) + "\n")
+        GEN_FILE.write_text(str(time.time_ns()) + "\n")  # see read_msg()
     except OSError:
         pass
     try:
@@ -372,7 +450,7 @@ class Navigateur:
         self.me = self_tty()
         self.published: str | None = None
         self.role = read_role(self.me)
-        self.seen = read_cwd()  # what a follower has already acted on
+        self.seen = None  # the message a follower has already acted on
         if self.role == "solo" and bool(cfg["behavior"]["follow_default"]):
             # The old broadcast-by-default switch, read as "start this window
             # leading". A saved role always wins: the config only gets a say
@@ -393,7 +471,7 @@ class Navigateur:
                 return
             for _name, path, is_dir in list_dir(d, self.show_hidden):
                 rows.append(Row(path, depth, is_dir))
-                if is_dir and str(path) in self.expanded:
+                if is_dir and self.is_open(path):
                     walk(path, depth + 1)
 
         walk(self.root, 0)
@@ -402,6 +480,19 @@ class Navigateur:
 
     def current(self) -> Row | None:
         return self.rows[self.cursor] if self.rows else None
+
+    # `expanded` is keyed on str, not Path: a set of Paths would compare by a
+    # richer notion of equality than the one thing we mean here, which is "the
+    # same string we walked with". These three are the only way in or out.
+
+    def is_open(self, path: Path) -> bool:
+        return str(path) in self.expanded
+
+    def open_node(self, path: Path) -> None:
+        self.expanded.add(str(path))
+
+    def close_node(self, path: Path) -> None:
+        self.expanded.discard(str(path))
 
     def published_dir(self) -> Path:
         """THE publish rule: the nearest enclosing directory of the highlighted
@@ -441,11 +532,23 @@ class Navigateur:
         would race it for the bytes. The shell keeps its own copy of the
         message, so quitting still lands the shell in the same place."""
         dest = read_cwd()
-        if dest is None or (dest == self.seen and not force):
+        if dest is None:
             return False
-        self.seen = dest  # recorded before acting, like _NAV_SEEN in nav.zsh
+        msg = read_msg(dest)
+        if msg == self.seen and not force:
+            return False
+        self.seen = msg  # recorded before acting, like _NAV_SEEN in nav.zsh
         target = Path(dest)
-        if not target.is_dir() or target == self.published_dir():
+        if not target.is_dir():
+            return False
+        # "Already there" has to mean this directory's *contents* are on screen,
+        # not merely that the cursor sits on its row. A folder under the cursor
+        # is collapsed until something expands it, so testing published_dir()
+        # alone left the leader's directory selected and unopened -- and stuck
+        # that way, since every later message naming it took this same exit.
+        # The root is never in `expanded` and is always open.
+        if target == self.published_dir() and (
+                target == self.root or self.is_open(target)):
             return False
         self.reveal_path(target)
         return True
@@ -458,7 +561,7 @@ class Navigateur:
             rel = target.relative_to(self.root)
         except ValueError:
             self.root = target
-            self.expanded.add(str(target))
+            self.open_node(target)
             self.rebuild()
             self.cursor = 0
             return
@@ -469,7 +572,7 @@ class Navigateur:
         node = self.root
         for part in rel.parts:
             node = node / part
-            self.expanded.add(str(node))
+            self.open_node(node)
         self.rebuild()
         self.select_path(target)
 
@@ -486,15 +589,15 @@ class Navigateur:
         if row is None:
             return
         if row.is_dir:
-            self.expanded.add(str(row.path))
+            self.open_node(row.path)
             self.rebuild()
 
     def leave(self) -> None:
         """h -- collapse if expanded, else jump to the parent row, else re-root
         one level up. That last case is the `..` from start.txt."""
         row = self.current()
-        if row is not None and row.is_dir and str(row.path) in self.expanded:
-            self.expanded.discard(str(row.path))
+        if row is not None and row.is_dir and self.is_open(row.path):
+            self.close_node(row.path)
             self.rebuild()
             return
         if row is not None and row.depth > 0:
@@ -506,15 +609,32 @@ class Navigateur:
             return  # already at /
         old = self.root
         self.root = parent
-        self.expanded.add(str(old))
+        self.open_node(old)
         self.rebuild()
         self.select_path(old)
 
     def open_it(self, reveal: bool = False) -> None:
+        """o / O -- hand the highlighted row to the desktop.
+
+        macOS gets `open`; anything else gets the freedesktop equivalents, but
+        only when there is a display to open onto -- over ssh to a headless box
+        xdg-open would either fail silently or, worse, act on somebody else's
+        session. Like spawn_terminal(), every unsupported case sets a message
+        and returns rather than raising out of the browser."""
         row = self.current()
         if row is None:
             return
-        args = ["open", "-R", str(row.path)] if reveal else ["open", str(row.path)]
+        if IS_MAC:
+            args = ["open", "-R", str(row.path)] if reveal else ["open", str(row.path)]
+        else:
+            if not has_display():
+                what = "O" if reveal else "o"
+                self.message = f"no display -- {what} needs a desktop session"
+                return
+            args = self._linux_open_args(row.path, reveal)
+            if args is None:
+                self.message = "xdg-open not found"
+                return
         try:
             subprocess.run(args, stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL, check=False)
@@ -522,17 +642,48 @@ class Navigateur:
         except OSError as exc:
             self.message = f"open failed: {exc}"
 
+    @staticmethod
+    def _linux_open_args(path: Path, reveal: bool) -> list[str] | None:
+        """Reveal is the awkward half: freedesktop has no `open -R`, only the
+        FileManager1 D-Bus call that Nautilus, Dolphin and Thunar all implement.
+        Without gdbus, opening the parent directory is the honest approximation
+        -- the file manager lands in the right folder, just without the
+        selection."""
+        if reveal and shutil.which("gdbus"):
+            uri = "file://" + quote(str(path))
+            return ["gdbus", "call", "--session",
+                    "--dest", "org.freedesktop.FileManager1",
+                    "--object-path", "/org/freedesktop/FileManager1",
+                    "--method", "org.freedesktop.FileManager1.ShowItems",
+                    f"['{uri}']", ""]
+        if not shutil.which("xdg-open"):
+            return None
+        return ["xdg-open", str(path.parent if reveal else path)]
+
     def spawn_terminal(self, new_window: bool) -> None:
         """w / t -- open a new terminal window or tab already cd'd here.
 
         published_dir(), deliberately, and not row.path the way open_it() does:
         `o` opens the highlighted *file*, but a shell can only cd to a
         directory, so this is the same "where am I" rule the followers and
-        $NAV_LASTDIR use. macOS only, like open_it().
+        $NAV_LASTDIR use.
 
         Every unsupported case sets a message and returns. This key must never
         be the one that raises out of the browser."""
         d = str(self.published_dir())
+        what = "window" if new_window else "tab"
+        try:
+            spawned = (self._spawn_macos(d, new_window) if IS_MAC
+                       else self._spawn_linux(d, new_window))
+        except OSError as exc:
+            self.message = f"new {what} failed: {exc}"
+            return
+        if spawned:
+            self.message = f"new {what} in {home_short(Path(d))}"
+
+    def _spawn_macos(self, d: str, new_window: bool) -> bool:
+        """Warp by deep link, iTerm and Terminal.app by AppleScript, keyed off
+        $TERM_PROGRAM. Returns False having set a message when it cannot."""
         term = os.environ.get("TERM_PROGRAM", "")
         what = "window" if new_window else "tab"
         # cd argument for the AppleScript terminals: shell-quoted, then escaped
@@ -562,7 +713,7 @@ class Navigateur:
                 # `do script` only ever makes a window; a tab needs a synthetic
                 # cmd-t through System Events, i.e. an Accessibility grant.
                 self.message = "Terminal.app has no scriptable new tab -- w works"
-                return
+                return False
             args = ["osascript", "-e",
                     f'tell application "Terminal"\n'
                     f'do script "{cd}"\n'
@@ -571,60 +722,116 @@ class Navigateur:
         else:
             self.message = (f"no new-{what} support for "
                             f"{term or 'this terminal (TERM_PROGRAM unset)'}")
-            return
+            return False
 
-        try:
-            subprocess.run(args, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, check=False)
-            self.message = f"new {what} in {home_short(Path(d))}"
-        except OSError as exc:
-            self.message = f"new {what} failed: {exc}"
+        # `open` and `osascript` both hand off and return, so run() is fine
+        # here where the Linux path needs Popen.
+        subprocess.run(args, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, check=False)
+        return True
+
+    def _spawn_linux(self, d: str, new_window: bool) -> bool:
+        """The first installed terminal from LINUX_TERMINALS, or $NAV_TERMINAL.
+
+        $TERM_PROGRAM is a macOS convention and is unset over ssh, so this asks
+        the filesystem instead of the environment: which terminal is *here*.
+        An unrecognised $NAV_TERMINAL is launched bare with cwd=d -- inheriting
+        the working directory is the one thing every terminal does -- while the
+        known ones take an explicit flag, because gnome-terminal and konsole
+        hand the request to an already-running server whose cwd is not ours."""
+        what = "window" if new_window else "tab"
+        if not has_display():
+            return self._no(f"no display -- {what} needs a desktop session")
+
+        override = os.environ.get("NAV_TERMINAL", "").strip()
+        if override:
+            exe = shlex.split(override)[0]
+            if not shutil.which(exe):
+                return self._no(f"$NAV_TERMINAL: {exe} not found")
+            if exe not in LINUX_TERMINALS:
+                if not new_window:
+                    return self._no(f"no new-tab support for {exe}")
+                launch_detached(shlex.split(override), cwd=d)
+                return True
+            name = exe
+            base = shlex.split(override)
+        else:
+            name = next((t for t in LINUX_TERMINALS if shutil.which(t)), None)
+            if name is None:
+                return self._no("no supported terminal found -- "
+                                "set $NAV_TERMINAL")
+            base = [name]
+
+        window_args, tab_args = LINUX_TERMINALS[name]
+        flags = window_args if new_window else tab_args
+        if flags is None:
+            return self._no(f"{name} has no scriptable new tab -- w works")
+        launch_detached(base + [a.format(d=d) for a in flags])
+        return True
+
+    def _no(self, message: str) -> bool:
+        self.message = message
+        return False
 
     # -- render -----------------------------------------------------------
 
     def frame(self, cols: int, height: int) -> list[str]:
-        c = self.colors
-        border, dim, accent = fg(c["border"]), fg(c["dim"]), fg(c["accent"])
+        border = fg(self.colors["border"])
         width = max(30, min(cols, 200))
         inner = width - 2
         body_h = max(3, height - 4)
 
-        # keep the cursor inside the viewport, with a little breathing room
-        if self.cursor < self.top + 2:
-            self.top = max(0, self.cursor - 2)
-        if self.cursor > self.top + body_h - 3:
-            self.top = self.cursor - body_h + 3
-        self.top = max(0, min(self.top, max(0, len(self.rows) - body_h)))
+        self._scroll_into_view(body_h)
 
-        if self.role == "leader":
-            flag, flag_fg = " leading ", accent
-        elif self.role == "follower":
-            flag, flag_fg = " following ", dim
-        else:
-            flag, flag_fg = "", ""
-        # The title must never widen the box: elide from the LEFT, since the
-        # tail of a path is the informative half.
-        room = inner - 3 - len(flag)
-        raw = home_short(self.root)
-        if len(raw) > room:
-            raw = "…" + raw[-(room - 1):] if room > 1 else ""
-        title = " " + raw + " "
-        fill = max(0, inner - 1 - len(title) - len(flag) - 1)
-        lines = [
-            f"{border}╭─{accent}{BOLD}{title}{RESET}"
-            f"{flag_fg}{flag}{border}{'─' * fill}╮{RESET}"
-        ]
-
+        lines = [self._title_line(inner)]
         for i in range(body_h):
             idx = self.top + i
             if idx >= len(self.rows):
                 lines.append(f"{border}│{RESET}{' ' * inner}{border}│{RESET}")
                 continue
             lines.append(self.render_row(idx, inner, border))
-
         lines.append(f"{border}╰{'─' * inner}╯{RESET}")
+        lines.append(self._hint_line(cols))
 
-        # Drop whole hint segments rather than slicing a word in half.
+        while len(lines) < height:
+            lines.append("")
+        return lines[:height]
+
+    def _scroll_into_view(self, body_h: int) -> None:
+        """Keep the cursor inside the viewport, with a little breathing room.
+        Mutates self.top, so it has to run before anything reads it -- which is
+        why frame() calls it above the row loop rather than beside the other
+        line builders."""
+        if self.cursor < self.top + 2:
+            self.top = max(0, self.cursor - 2)
+        if self.cursor > self.top + body_h - 3:
+            self.top = self.cursor - body_h + 3
+        self.top = max(0, min(self.top, max(0, len(self.rows) - body_h)))
+
+    def _title_line(self, inner: int) -> str:
+        """The top border: the role flag, and the root path elided from the
+        LEFT -- the tail of a path is the informative half -- so that the title
+        can never widen the box."""
+        c = self.colors
+        border, dim, accent = fg(c["border"]), fg(c["dim"]), fg(c["accent"])
+        if self.role == "leader":
+            flag, flag_fg = " leading ", accent
+        elif self.role == "follower":
+            flag, flag_fg = " following ", dim
+        else:
+            flag, flag_fg = "", ""
+        room = inner - 3 - len(flag)
+        raw = home_short(self.root)
+        if len(raw) > room:
+            raw = "…" + raw[-(room - 1):] if room > 1 else ""
+        title = " " + raw + " "
+        fill = max(0, inner - 1 - len(title) - len(flag) - 1)
+        return (f"{border}╭─{accent}{BOLD}{title}{RESET}"
+                f"{flag_fg}{flag}{border}{'─' * fill}╮{RESET}")
+
+    def _hint_line(self, cols: int) -> str:
+        """A transient message, or the key hints -- dropping whole hint
+        segments rather than slicing a word in half."""
         if self.message:
             hint = self.message
         else:
@@ -634,11 +841,7 @@ class Navigateur:
             while segs and len(hint) > cols - 3:
                 segs.pop(-2 if len(segs) > 1 else 0)
                 hint = " · ".join(segs)
-        lines.append(f"  {dim}{hint[:max(0, cols - 3)]}{RESET}")
-        while len(lines) < height:
-            lines.append("")
-        return lines[:height]
-
+        return f"  {fg(self.colors['dim'])}{hint[:max(0, cols - 3)]}{RESET}"
     def render_row(self, idx: int, inner: int, border: str) -> str:
         c = self.colors
         row = self.rows[idx]
@@ -647,7 +850,7 @@ class Navigateur:
         # clamp the indent so very deep nesting can't drive text_w negative
         pad = "  " * min(row.depth, max(0, (inner - 12) // 2))
         if row.is_dir:
-            tri = "▾" if str(row.path) in self.expanded else "▸"
+            tri = "▾" if self.is_open(row.path) else "▸"
             name = f"{fg(c['dim'])}{tri} {fg(c['dir'])}{row.path.name}/{RESET}"
             plain = f"{tri} {row.path.name}/"
         else:
@@ -724,6 +927,13 @@ class Navigateur:
                 if self.role == "follower":
                     if self.set_role("solo"):
                         self.message = "stopped following"
+                elif find_leader(self.me) is None:
+                    # Promotion only. The role file is shared with the shell, so
+                    # an unguarded `f` would recreate the leaderless follower
+                    # `n follow` now refuses. A message and a return, never a
+                    # raise: these keys must not be the ones that kill the
+                    # browser.
+                    self.message = "no leader — press F in the window that should lead"
                 elif self.set_role("follower"):
                     self.message = "following the leader"
                     self.sync_from_leader(force=True)  # `f` means "sync me now"
