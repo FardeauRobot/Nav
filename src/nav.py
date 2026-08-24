@@ -33,6 +33,7 @@ except ModuleNotFoundError:  # pragma: no cover - 3.11+ has it
 
 STATE = Path(os.environ.get("NAV_STATE", str(Path.home() / ".navigateur")))
 SUB = STATE / "sub"
+ROLES = STATE / "roles"
 CWD_FILE = STATE / "cwd"
 CONFIG = STATE / "config.toml"
 
@@ -51,7 +52,7 @@ selected_bg = "#292e42"
 
 [behavior]
 show_hidden    = false
-follow_default = false
+follow_default = false   # start this window as the leader
 '''
 
 DEFAULTS = {
@@ -162,6 +163,60 @@ def self_tty() -> str | None:
     return None
 
 
+def read_role(me: str | None) -> str:
+    """This window's role: leader, follower or solo.
+
+    $NAV_STATE/roles/<tty> is the single source of truth and the seam with the
+    shell. Writing it is all this process can do about a role -- only a shell
+    can register a FIFO with `zle -F` -- so nav.zsh's _nav_reconcile brings the
+    live machinery in line afterwards. An unreadable or junk value degrades to
+    solo rather than costing you the browser."""
+    if me is None:
+        return "solo"
+    try:
+        value = (ROLES / me).read_text().strip()
+    except OSError:
+        return "solo"
+    return value if value in ("leader", "follower") else "solo"
+
+
+def write_role(me: str | None, role: str) -> bool:
+    if me is None:
+        return False
+    try:
+        ROLES.mkdir(parents=True, exist_ok=True)
+        if role == "solo":
+            (ROLES / me).unlink(missing_ok=True)
+        else:
+            (ROLES / me).write_text(role + "\n")
+    except OSError:
+        return False
+    if role == "leader":
+        # Exactly one leader. Enforced only here, on promotion -- reading a
+        # role never globs this directory, it reads one file by name.
+        try:
+            others = [q for q in ROLES.iterdir() if q.name != me]
+        except OSError:
+            others = []
+        for q in others:
+            try:
+                if q.read_text().strip() == "leader":
+                    q.unlink()
+            except OSError:
+                pass
+    return True
+
+
+def read_cwd() -> str | None:
+    """Where the leader is. Both publishers -- publish() below and nav.zsh's
+    _nav_publish -- write this file, so it is the one place a follower has to
+    look."""
+    try:
+        return CWD_FILE.read_text().strip() or None
+    except OSError:
+        return None
+
+
 def publish(path: Path, me: str | None) -> None:
     """Broadcast a directory to every subscribed terminal."""
     payload = (str(path) + "\n").encode()
@@ -261,7 +316,13 @@ class Screen:
             sys.stdout.flush()
         self.prev = list(lines)
 
-    def key(self) -> str | None:
+    def key(self, timeout: float | None = None) -> str | None:
+        """timeout is how a follower stays responsive to the leader while
+        nobody is typing: select first, and report None when it expires."""
+        if timeout is not None:
+            r, _, _ = select.select([self.fd], [], [], timeout)
+            if not r:
+                return None
         try:
             ch = os.read(self.fd, 1)
         except (OSError, InterruptedError):
@@ -304,13 +365,20 @@ class Navigateur:
         self.cfg = cfg
         self.colors = cfg["colors"]
         self.show_hidden = bool(cfg["behavior"]["show_hidden"])
-        self.broadcast = bool(cfg["behavior"]["follow_default"])
         self.expanded: set[str] = set()
         self.cursor = 0
         self.top = 0
         self.rows: list[Row] = []
         self.me = self_tty()
         self.published: str | None = None
+        self.role = read_role(self.me)
+        self.seen = read_cwd()  # what a follower has already acted on
+        if self.role == "solo" and bool(cfg["behavior"]["follow_default"]):
+            # The old broadcast-by-default switch, read as "start this window
+            # leading". A saved role always wins: the config only gets a say
+            # when there is no role file at all.
+            write_role(self.me, "leader")
+            self.role = "leader"
         self.chosen: Path | None = None
         self.message = ""
         self.rebuild()
@@ -345,8 +413,8 @@ class Navigateur:
         return row.path if row.is_dir else row.path.parent
 
     def maybe_publish(self) -> None:
-        if not self.broadcast:
-            return
+        if self.role != "leader":
+            return  # structural: a follower can never publish
         target = str(self.published_dir())
         if target == self.published:
             return  # de-dupe: arrowing between sibling files must not re-fire
@@ -358,6 +426,52 @@ class Navigateur:
             if row.path == path:
                 self.cursor = i
                 return
+
+    def set_role(self, role: str) -> bool:
+        if not write_role(self.me, role):
+            self.message = "cannot write the role file"
+            return False
+        self.role = role
+        self.published = None  # a fresh leader must state where it is
+        return True
+
+    def sync_from_leader(self, force: bool = False) -> bool:
+        """Follower poll. Reads $NAV_STATE/cwd rather than this terminal's
+        FIFO: the shell holds that FIFO open for `zle -F` and a second reader
+        would race it for the bytes. The shell keeps its own copy of the
+        message, so quitting still lands the shell in the same place."""
+        dest = read_cwd()
+        if dest is None or (dest == self.seen and not force):
+            return False
+        self.seen = dest  # recorded before acting, like _NAV_SEEN in nav.zsh
+        target = Path(dest)
+        if not target.is_dir() or target == self.published_dir():
+            return False
+        self.reveal_path(target)
+        return True
+
+    def reveal_path(self, target: Path) -> None:
+        """Put the cursor on target: expand the ancestors when it is under the
+        current root, otherwise re-root there -- the same move `h` makes when
+        it runs out of parents."""
+        try:
+            rel = target.relative_to(self.root)
+        except ValueError:
+            self.root = target
+            self.expanded.add(str(target))
+            self.rebuild()
+            self.cursor = 0
+            return
+        if not rel.parts:
+            self.rebuild()
+            self.cursor = 0
+            return
+        node = self.root
+        for part in rel.parts:
+            node = node / part
+            self.expanded.add(str(node))
+        self.rebuild()
+        self.select_path(target)
 
     # -- actions ----------------------------------------------------------
 
@@ -482,7 +596,12 @@ class Navigateur:
             self.top = self.cursor - body_h + 3
         self.top = max(0, min(self.top, max(0, len(self.rows) - body_h)))
 
-        flag = " following " if self.broadcast else ""
+        if self.role == "leader":
+            flag, flag_fg = " leading ", accent
+        elif self.role == "follower":
+            flag, flag_fg = " following ", dim
+        else:
+            flag, flag_fg = "", ""
         # The title must never widen the box: elide from the LEFT, since the
         # tail of a path is the informative half.
         room = inner - 3 - len(flag)
@@ -493,7 +612,7 @@ class Navigateur:
         fill = max(0, inner - 1 - len(title) - len(flag) - 1)
         lines = [
             f"{border}╭─{accent}{BOLD}{title}{RESET}"
-            f"{fg(c['dim'])}{flag}{border}{'─' * fill}╮{RESET}"
+            f"{flag_fg}{flag}{border}{'─' * fill}╮{RESET}"
         ]
 
         for i in range(body_h):
@@ -509,7 +628,7 @@ class Navigateur:
         if self.message:
             hint = self.message
         else:
-            segs = ["hjkl move", "o open", "O reveal", "f follow",
+            segs = ["hjkl move", "o open", "O reveal", "F lead", "f follow",
                     ". hidden", "↵ cd here", "w window", "t tab", "q quit"]
             hint = " · ".join(segs)
             while segs and len(hint) > cols - 3:
@@ -556,8 +675,14 @@ class Navigateur:
         while True:
             cols, height = screen.measure()
             screen.paint(self.frame(cols, height))
-            key = screen.key()
+            # A follower wakes up on its own to check on the leader;
+            # everybody else blocks on the keyboard the way they always did.
+            key = screen.key(0.2 if self.role == "follower" else None)
             if key is None:
+                # Poll *before* looping, or this is a 5Hz spin on measure()'s
+                # ioctl with nothing to show for it.
+                if self.role == "follower":
+                    self.sync_from_leader()
                 continue
             had_message = bool(self.message)
             self.message = ""
@@ -589,13 +714,19 @@ class Navigateur:
                 # so paint()'s diff would keep a stale frame. Blank prev the way
                 # _resized() does and repaint whole.
                 screen.prev = []
+            elif key == "F":
+                if self.role == "leader":
+                    if self.set_role("solo"):
+                        self.message = "stopped leading"
+                elif self.set_role("leader"):
+                    self.message = "leading — followers track this window"
             elif key == "f":
-                self.broadcast = not self.broadcast
-                self.published = None
-                self.message = (
-                    "broadcasting to following terminals"
-                    if self.broadcast else "stopped broadcasting"
-                )
+                if self.role == "follower":
+                    if self.set_role("solo"):
+                        self.message = "stopped following"
+                elif self.set_role("follower"):
+                    self.message = "following the leader"
+                    self.sync_from_leader(force=True)  # `f` means "sync me now"
             elif key == ".":
                 self.show_hidden = not self.show_hidden
                 self.rebuild()

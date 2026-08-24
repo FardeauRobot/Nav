@@ -1,18 +1,18 @@
 # navigateur
 
 A file explorer that lives in the terminal. Expanding tree like the VSCode
-explorer, `hjkl` keys, hex-configurable colours — and it can make your *other*
-terminals follow along as you browse.
+explorer, `hjkl` keys, hex-configurable colours — and one window can take the
+lead and drag your *other* terminals along with it.
 
 ```
-╭─ ~/Desktop/navigateur  following ───────╮
+╭─ ~/Desktop/navigateur   leading ────────╮
 │   ▾ src/                                │
 │ ❯     nav.py                            │
 │       nav.zsh                           │
 │     README.md                           │
 │     start.txt                           │
 ╰─────────────────────────────────────────╯
-  hjkl move · o open · O reveal · q quit
+  hjkl move · F lead · f follow · q quit
 ```
 
 Stdlib-only Python 3 + zsh. No dependencies, no build step.
@@ -43,7 +43,8 @@ the function cds there afterwards — the same trick `ranger` and `lf` use.
 | `O` | reveal in Finder (opens the parent with the file selected) |
 | `w` | open this folder in a **new terminal window** |
 | `t` | open this folder in a **new terminal tab** |
-| `f` | start/stop broadcasting — while on, every move drags the following terminals along |
+| `F` | make this window the **leader** — the others follow where it goes |
+| `f` | make this window a **follower** of the leader |
 | `.` | show/hide dotfiles |
 | `g` / `G` | top / bottom |
 | `↵` | quit **and** cd your shell here |
@@ -72,38 +73,55 @@ instead. **Warp has no pane action** — `split_pane`, `new_pane`, `add_pane` an
 `split_pane_right` are all rejected that way, so `t` cannot split the current
 tab through the URI scheme.
 
-## Making other terminals follow
+## Leader and followers
 
-Following has **two halves, and you need both**. They are set independently:
+Windows have a **role**, the way decks in a DJ booth have a master: one window
+**leads**, the others **follow** its current directory. Set the role from inside
+the browser, or from a prompt — the two are the same thing:
 
-| | where | how | scope |
-|---|---|---|---|
-| **subscribe** — this terminal accepts being moved | any terminal | `navigate follow on` | that terminal, until `off` or it closes |
-| **broadcast** — this browser sends where it is | inside the browser | press `f` | that browsing session |
+| | in `navigate` | at a prompt |
+|---|---|---|
+| **lead** — this window is the master | `F` | `navigate lead` |
+| **follow** — this window tracks the leader | `f` | `navigate follow` |
+| **neither** | `F` / `f` again | `navigate solo` |
 
-So: run `navigate follow on` in the terminals you want dragged around, open
-`navigate` in another one, and press **`f`**.
+`navigate status` says which role this window holds and who the leader is.
+`navigate follow on|off|toggle|status` still works and means the same thing.
 
-**`f` is a mode, not a send.** It does not push the current directory once — it
-switches broadcasting on and leaves it on. From then on every `j`/`k`/`l`/`h`
-that changes directory moves the subscribed terminals immediately, live, as you
-browse. Press `f` again to stop; they stay wherever they last landed.
+There is **exactly one leader**. Pressing `F` in a second window takes the lead
+away from the first, which notices at its next prompt and goes solo — you never
+have to demote anyone by hand.
 
-You can always see which state you are in: the title bar shows a dim
-`following` while broadcasting is on, and toggling prints
-`broadcasting to following terminals` / `stopped broadcasting` on the hint line.
+The role belongs to the *window*, not to a browsing session: it survives
+quitting the browser, and lasts until you change it or close the terminal.
 
-**What they cd to** is defined by one rule: *the nearest enclosing directory of
-the highlighted row* — the row itself if it's a folder, its parent if it's a
-file. So arrowing between two files in the same folder does not move anybody;
-stepping into a new folder does. The same rule decides where `↵` puts you.
+### What the followers track
 
-Quitting does not pull anyone back: `q` and `↵` only affect *your* shell, and
-the subscribed terminals keep the last directory you broadcast.
+The leader's **current directory**, however it got there:
+
+- you type `cd somewhere` → the followers move
+- you press `↵` in the browser → the followers move there with you
+- you *browse* in the leader → the followers move **live**, as you move
+
+That last one is a preview. While you browse, "where the leader is" means the
+highlighted row's **nearest enclosing directory** — the row itself if it is a
+folder, its parent if it is a file. So arrowing between two files in the same
+folder moves nobody; stepping into a new folder does. The same rule decides
+where `↵`, `w` and `t` put you.
+
+**Quitting the browser with `q` snaps the followers back** to the leader's real
+directory — the preview is over, and that is where the leader window actually
+is. Press `↵` instead and the leader goes there too, so everybody stays
+together. (Earlier versions left the followers behind; they now follow the
+window, not the browsing session.)
+
+A follower that is *itself* running `navigate` does not just move its shell —
+**its tree moves**, expanding out to the leader's directory while you watch. Put
+two windows side by side and browse in the leader to see it.
 
 ### The two delivery modes
 
-`navigate follow on` reports which one that terminal got:
+`navigate follow` reports which one that terminal got:
 
 - **live** — the terminal jumps immediately, even sitting idle at a prompt.
   Uses zsh's `zle -F` on a per-terminal FIFO. An idle zsh is blocked reading
@@ -112,25 +130,33 @@ the subscribed terminals keep the last directory you broadcast.
   when `zle` isn't available; costs immediacy and nothing else.
 
 Which one you get in **Warp specifically is unverified** — `zle -F` needs a live
-interactive prompt, so it can't be tested from a script. Run `navigate follow on` in a
+interactive prompt, so it can't be tested from a script. Run `navigate follow` in a
 Warp tab and it will tell you. If it says `lazy`, following still works, it just
 waits for your next Enter.
 
-`navigate follow status` tells you the mode and the *live* subscriber count
-(it counts FIFOs, and a lazy terminal has none — `0 subscribed` while following is
-normal, not a fault);
-`navigate follow toggle` flips subscription for the current terminal.
+The leader publishes without blocking, using `sysopen -o nonblock` from zsh's
+`zsh/system` module. If that module is missing, the leader still writes the
+shared file below and every follower degrades to lazy — nothing breaks.
 
-### Two things that surprise people
+`navigate status` also prints the *live* subscriber count (it counts FIFOs, and
+a lazy terminal has none — `0 live-subscribed` while someone is following is
+normal, not a fault).
+
+### Three things that surprise people
 
 The last broadcast directory is also kept in `~/.navigateur/cwd`, and *every*
-subscribed terminal — live ones included — checks it at each prompt. A terminal
-that subscribes after you've already been browsing will therefore jump to that
-stored directory on its next Enter, without any new broadcast.
+follower — live ones included — checks it at each prompt. A window that starts
+following after the leader has been browsing will therefore jump to that stored
+directory on its next Enter, without any new broadcast.
 
-Terminals closed without `navigate follow off` clean themselves up: writing to their
+Terminals closed without `navigate solo` clean themselves up: writing to their
 FIFO returns `ENXIO`, which is exactly the "nobody is reading" signal, so the
 sweep costs no extra work.
+
+A window that is *killed* outright can leave its role behind in
+`~/.navigateur/roles/`. Terminal names get recycled, so a fresh window landing
+on that name would inherit a stranger's role — it doesn't: a role that the
+current shell never took itself is dropped the first time you use `navigate`.
 
 ## Colours
 
@@ -147,12 +173,14 @@ selected_bg = "#292e42"
 
 [behavior]
 show_hidden    = false
-follow_default = false
+follow_default = false   # start this window as the leader
 ```
 
-`follow_default = true` is the **broadcast** side, not the subscribe side: it
-starts every browser session as if you had already pressed `f`. It does not make
-any terminal follow — that is still `navigate follow on`, per terminal.
+`follow_default = true` is the **leader** side: it starts every browser session
+as if you had pressed `F`, so that window takes the lead. It does not make any
+terminal follow — that is still `f` / `navigate follow`, per window. A role you
+have already set wins over it: the setting only speaks when the window has no
+role yet.
 
 Plain 24-bit hex, no palette slots. A bad value falls back key by key rather
 than failing — a typo shouldn't cost you the browser you'd use to fix it.
@@ -163,7 +191,7 @@ than failing — a typo shouldn't cost you the browser you'd use to fix it.
 |---|---|
 | `src/nav.py` | the TUI — raw ANSI, never writes data to stdout |
 | `src/nav.zsh` | the `nav()` function (`navigate`/`n` alias it), follow subscription, hooks |
-| `~/.navigateur/` | `config.toml`, `cwd`, `sub/<tty>.fifo` |
+| `~/.navigateur/` | `config.toml`, `cwd`, `roles/<tty>`, `sub/<tty>.fifo` |
 
 Hooks install via `add-zsh-hook`, never by assigning `precmd_functions` — Warp
 already has entries there and clobbering the array breaks the terminal.
