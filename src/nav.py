@@ -56,6 +56,17 @@ def group_ok(group: str) -> bool:
     return 1 <= len(group) <= 32 and set(group) <= _GROUP_CHARS
 
 
+def name_ok(name: str) -> str:
+    """Why `name` cannot be a new file's name, or "" if it can. A filename is
+    one path component, never a `/`-separated path that could escape the
+    browsed directory via `..` -- the same class of rule as group_ok()."""
+    if "/" in name:
+        return "name cannot contain /"
+    if name in (".", ".."):
+        return f"'{name}' is not a valid name"
+    return ""
+
+
 # One group's broadcast directory. The group is in the *path* here and in the
 # *content* of roles/<tty>, and the split is forced by which paths are hot:
 # read_role() reads one file by a name it already knows and runs at every prompt
@@ -156,11 +167,13 @@ KEY_SECTIONS: list[tuple[str, list[tuple[str | None, str, str, str]]]] = [
     ("opening", [
         ("open", "o", "", "open in the default app"),
         ("reveal", "O", "", "reveal in the file manager"),
+        ("edit", "E", "", "edit in neovim"),
         ("window", "w", "", "new terminal window here"),
         ("tab", "t", "", "new terminal tab here"),
         ("hidden", ".", "", "show or hide dotfiles"),
     ]),
     ("files", [
+        ("new_file", "n", "", "new empty file here"),
         ("mark", "e", "", "mark or unmark a row"),
         ("op_move", "m", "", "move marked items here"),
         ("op_copy", "c", "", "copy marked items here"),
@@ -659,6 +672,27 @@ class Screen:
             termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
             self.saved = None
 
+    def suspend(self) -> None:
+        """Hand the real terminal to a foreground child (nvim). Unlike
+        restore(), self.saved is kept and the wakeup pipe/signal handlers
+        stay armed -- this is a loan, not a shutdown, so a SIGHUP arriving
+        while the child owns the terminal still finds _bail() able to
+        restore correctly."""
+        sys.stdout.write("\x1b[?25h\x1b[?1049l" + RESET)
+        sys.stdout.flush()
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+
+    def resume(self) -> None:
+        """Take the terminal back after the child exits. The tcflush
+        discards whatever the child's own exit left queued -- undrained, a
+        stray keystroke decodes through key() as a real key and, with no
+        pending_op, can quit the browser outright."""
+        tty.setcbreak(self.fd)
+        termios.tcflush(self.fd, termios.TCIFLUSH)
+        sys.stdout.write("\x1b[?1049h\x1b[?25l")
+        sys.stdout.flush()
+        self.prev = []  # force a full repaint -- the terminal was on loan
+
     def _bail(self, *_a) -> None:
         self.restore()
         os._exit(0)
@@ -940,6 +974,37 @@ class Navigateur:
         screen.paint(self.frame(cols, height))
         return screen.key(None)
 
+    def read_line(self, screen: Screen, cols: int, height: int,
+                  prompt: str) -> str | None:
+        """Block for a typed line after `prompt`, repainting the
+        in-progress buffer on every keystroke via self.message -- the
+        multi-character sibling of read_slot(). Returns the typed text, or
+        None on ESC. Ctrl-c/ctrl-d come back raw so the caller can still
+        quit the browser from inside this prompt, the same contract
+        read_slot()'s callers use."""
+        buf = ""
+        while True:
+            budget = max(0, cols - 3)
+            shown = prompt + buf
+            if len(shown) > budget - 1:
+                room = budget - len(prompt) - 1
+                shown = prompt + ("…" + buf[-(room - 1):] if room > 1 else "")
+            self.message = shown + "_"
+            screen.paint(self.frame(cols, height))
+            key = screen.key(None)
+            if key is None:
+                continue  # a resize woke the wakeup pipe -- repaint, don't cancel
+            if key in ("\x03", "\x04"):
+                return key
+            if key == "ESC":
+                return None
+            if key == "ENTER":
+                return buf
+            if key in ("\x7f", "\x08"):
+                buf = buf[:-1]
+            elif len(key) == 1 and key.isprintable():
+                buf += key
+
     # -- actions ----------------------------------------------------------
 
     def move(self, delta: int) -> None:
@@ -1023,6 +1088,28 @@ class Navigateur:
         if not shutil.which("xdg-open"):
             return None
         return ["xdg-open", str(path.parent if reveal else path)]
+
+    def edit_it(self, screen: Screen) -> None:
+        """E -- open the highlighted row (file or folder) in nvim, in the
+        foreground, in this terminal. Unlike open_it()'s GUI handoff or
+        spawn_terminal()'s detached window, nvim needs the real tty, so the
+        alt screen and raw mode step aside for it via Screen.suspend()/
+        resume() rather than the Popen-and-forget pattern those two use."""
+        row = self.current()
+        if row is None:
+            return
+        if not shutil.which("nvim"):
+            self.message = "nvim not found"
+            return
+        screen.suspend()
+        try:
+            subprocess.run(["nvim", str(row.path)], check=False)
+        except OSError as exc:
+            self.message = f"nvim failed: {exc}"
+        finally:
+            screen.resume()
+        self.rebuild()  # nvim can rename/create/delete via netrw or :w
+        self.select_path(row.path)
 
     def spawn_terminal(self, new_window: bool) -> None:
         """w / t -- open a new terminal window or tab already cd'd here.
@@ -1136,6 +1223,32 @@ class Navigateur:
     def _no(self, message: str) -> bool:
         self.message = message
         return False
+
+    def create_file(self, name: str) -> None:
+        """n's second half -- create an empty file in published_dir().
+        Refuses a collision rather than overwriting, same rule as
+        _op_batch()'s preflight; exist_ok=False on touch() closes the
+        TOCTOU gap between that check and the write."""
+        why = name_ok(name)
+        if why:
+            self.message = why
+            return
+        dest = self.published_dir()
+        target = dest / name
+        if os.path.lexists(target):
+            self.message = f"'{name}' already exists"
+            return
+        try:
+            target.touch(exist_ok=False)
+        except OSError as exc:
+            self.message = f"could not create '{name}': {exc}"
+            return
+        self.open_node(dest)  # must run before rebuild(), or a new file
+        self.rebuild()        # inside a still-collapsed folder never shows
+        self.select_path(target)
+        hint = "" if self.show_hidden or not name.startswith(".") \
+            else f" (hidden -- {self.keys['hidden']} to show)"
+        self.message = f"created {name}{hint}"
 
     def toggle_mark(self) -> None:
         """e -- mark or unmark the highlighted row while a move, copy, cut
@@ -1898,6 +2011,8 @@ class Navigateur:
                 self.open_it()
             elif action == "reveal":
                 self.open_it(reveal=True)
+            elif action == "edit":
+                self.edit_it(screen)
             elif action in ("window", "tab"):
                 self.spawn_terminal(new_window=(action == "window"))
                 # A new tab lands on top of this session and no SIGWINCH fires,
@@ -1977,6 +2092,14 @@ class Navigateur:
                     self.try_delete(screen, cols, height)
                 else:
                     self.try_op(screen, cols, height)
+            elif action == "new_file":
+                name = self.read_line(screen, cols, height, "new file: ")
+                if name in ("\x03", "\x04"):
+                    return  # ctrl-c / ctrl-d still quit from inside the prompt
+                elif not name:
+                    self.message = "new file cancelled"
+                else:
+                    self.create_file(name)
             elif action == "mark":
                 self.toggle_mark()
             elif action == "hidden":

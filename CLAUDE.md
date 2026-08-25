@@ -334,6 +334,17 @@ Each of these looks like removable noise and is load-bearing:
   same rule as "stdout is the display, never a data channel", and a dropped wakeup byte only
   costs one late repaint; and the whole thing is wrapped so a failure degrades to the old
   press-a-key behaviour rather than costing you the browser.
+- **`Screen.suspend()`/`resume()` are a loan, not a shutdown.** `edit_it()` (`E`) is the first
+  code that hands the real terminal to a foreground child (`nvim`), and `restore()` is the
+  wrong tool for giving it back: `restore()` also calls `set_wakeup_fd(-1)` and clears
+  `self.saved`, which is correct for a one-time exit but would leave a SIGHUP arriving while
+  `nvim` owns the terminal unable to restore afterward. `suspend()`/`resume()` touch only the
+  raw-mode/alt-screen/cursor state and deliberately leave the wakeup pipe and signal handlers
+  armed the whole time — a `SIGWINCH` firing mid-edit just blanks `prev`, harmless with nothing
+  painting. `resume()`'s `termios.tcflush(TCIFLUSH)` is load-bearing, not cosmetic: without it,
+  a keystroke queued during `nvim`'s own exit sequence is still sitting in the tty buffer when
+  `key()` next reads, and decodes as a real keypress in the browser — a stray `ESC` with no
+  `pending_op` would quit it outright.
 - **Both backspaces erase.** The colour prompt accepts `\x7f` **and** `\x08` — which one a
   terminal sends depends on its erase setting, and a typing prompt where the erase key
   silently does nothing is the kind of bug nobody reports and everybody hates.

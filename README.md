@@ -140,10 +140,12 @@ what the `source` line in your `.zshrc` is for.
 | `.` | show/hide dotfiles |
 | `o` | open with the default app; a folder opens in the file manager |
 | `O` | reveal in the file manager (parent folder, file selected) |
+| `E` | edit the highlighted file or folder in `nvim`, taking over the terminal |
 | `w` | open this folder in a new terminal **window** |
 | `t` | open this folder in a new terminal **tab** |
 | `B` then `0`-`9` | bookmark the folder you're on under that digit |
 | `b` then `0`-`9` | go to that bookmark |
+| `n` | create a new empty file here, after typing a name |
 | `m` | enter **move mode**; `m` again moves everything marked to here (asks `y` to confirm) |
 | `c` | enter **copy mode**; `c` again copies everything marked to here (asks `y` to confirm) |
 | `x` | enter **cut mode**; `x` again relocates everything marked to here (asks `y` to confirm) -- the same operation as move, under its own key |
