@@ -165,6 +165,7 @@ KEY_SECTIONS: list[tuple[str, list[tuple[str | None, str, str, str]]]] = [
         ("op_move", "m", "", "move marked items here"),
         ("op_copy", "c", "", "copy marked items here"),
         ("op_cut", "x", "", "cut marked items here"),
+        ("op_delete", "d", "", "delete marked items"),
     ]),
     ("bookmarks", [
         ("bookmark_set", "B", "", "bookmark here, then a digit"),
@@ -627,7 +628,11 @@ class Screen:
             read_fd, write_fd = os.pipe()
             os.set_blocking(read_fd, False)
             os.set_blocking(write_fd, False)
-            signal.set_wakeup_fd(write_fd)
+            # warn_on_full_buffer=False: the default prints to stderr, and
+            # stderr here is the alt screen -- the same reason stdout is the
+            # display and never a data channel. A dropped wakeup byte costs
+            # one late repaint; a warning corrupts the frame.
+            signal.set_wakeup_fd(write_fd, warn_on_full_buffer=False)
             self.wake = read_fd
         except (OSError, ValueError):
             self.wake = -1  # degrade to the old behaviour, never to no browser
@@ -751,7 +756,8 @@ class Navigateur:
     # no longer does anything.
     @property
     def VERB_KEYS(self) -> dict[str, str]:
-        return {verb: self.keys["op_" + verb] for verb in ("move", "copy", "cut")}
+        return {verb: self.keys["op_" + verb]
+                for verb in ("move", "copy", "cut", "delete")}
 
     def __init__(self, root: Path, cfg: dict) -> None:
         self.root = root
@@ -760,7 +766,7 @@ class Navigateur:
         self.show_hidden = bool(cfg["behavior"]["show_hidden"])
         self.expanded: set[str] = set()
         self.marked: set[str] = set()
-        self.pending_op: str | None = None  # None, "move", "copy", or "cut"
+        self.pending_op: str | None = None  # None, "move", "copy", "cut", or "delete"
         self.cursor = 0
         self.top = 0
         self.rows: list[Row] = []
@@ -1132,13 +1138,14 @@ class Navigateur:
         return False
 
     def toggle_mark(self) -> None:
-        """e -- mark or unmark the highlighted row while a move, copy or cut
-        is pending. Marks are path strings, same convention as `expanded`:
-        independent of `self.rows`, so collapsing a marked folder never
-        unmarks it. Marks are shared across all three verbs -- switching
-        which verb key you press keeps whatever is already marked."""
+        """e -- mark or unmark the highlighted row while a move, copy, cut
+        or delete is pending. Marks are path strings, same convention as
+        `expanded`: independent of `self.rows`, so collapsing a marked
+        folder never unmarks it. Marks are shared across all four verbs --
+        switching which verb key you press keeps whatever is already
+        marked."""
         if self.pending_op is None:
-            self.message = "press m to move, c to copy, x to cut"
+            self.message = "press m to move, c to copy, x to cut, d to delete"
             return
         row = self.current()
         if row is None:
@@ -1152,8 +1159,9 @@ class Navigateur:
         n = len(self.marked)
         verb = self.pending_op
         letter = self.VERB_KEYS[verb]
-        self.message = (f"{n} marked -- {letter} to {verb} here" if n
-                        else f"{verb} mode -- e to mark, {letter} to {verb} here")
+        where = "" if verb == "delete" else " here"
+        self.message = (f"{n} marked -- {letter} to {verb}{where}" if n
+                        else f"{verb} mode -- e to mark, {letter} to {verb}{where}")
 
     def _op_batch(self, dest: Path) -> list[Path] | None:
         """The marked set, reduced to what actually needs to move/copy/cut:
@@ -1290,6 +1298,80 @@ class Navigateur:
         self.rebuild()
         self.select_path(dest)
 
+    def _delete_batch(self) -> list[Path]:
+        """The marked set, reduced to what actually needs deleting: nested
+        marks collapsed onto their ancestor, same rule as _op_batch's first
+        step. There is no destination for delete, so none of _op_batch's
+        collision/lexists checks apply -- this is deliberately not a call to
+        _op_batch with dest=None."""
+        marks = sorted((Path(p) for p in self.marked), key=lambda p: len(p.parts))
+        top: list[Path] = []
+        for p in marks:
+            if not any(p.is_relative_to(a) for a in top):
+                top.append(p)
+        return top
+
+    def try_delete(self, screen: Screen, cols: int, height: int) -> None:
+        """d, second press -- unlike move/copy/cut's one whole-batch prompt,
+        delete confirms per item: `y` deletes this one and asks again for the
+        next, `Y` deletes this one and every item still left in the batch
+        without asking again. Anything else is still try_op's "anything but y
+        cancels" rule -- it stops the rest of the batch, not just this item,
+        since a delete has no destination left to go clean up by hand."""
+        batch = self._delete_batch()
+        if not batch:
+            self.marked.clear()
+            self.pending_op = None
+            self.message = "nothing to delete"
+            return
+        deleted = 0
+        auto = False
+        for p in batch:
+            if not auto:
+                tail = " -- y/N, Y for all"
+                lead = "delete "
+                budget = max(0, cols - 3)
+                prompt = f"{lead}{p.name}?{tail}"
+                if len(prompt) > budget:
+                    room = budget - len(lead) - len(tail) - 1
+                    name = "…" + p.name[-(room - 1):] if room > 1 else ""
+                    prompt = f"{lead}{name}?{tail}"
+                reply = self.read_slot(screen, cols, height, prompt)
+                if reply in ("\x03", "\x04"):
+                    # Unlike try_op's ctrl-c (nothing mutated yet at that
+                    # point), earlier items in this loop may already be
+                    # gone from disk -- clear up the same as a cancel so
+                    # `marked`/`pending_op` and the tree don't go stale.
+                    self.message = f"deleted {deleted} of {len(batch)} -- cancelled"
+                    self.marked.clear()
+                    self.pending_op = None
+                    self.rebuild()
+                    return
+                if reply == "Y":
+                    auto = True
+                elif reply != "y":
+                    self.message = f"deleted {deleted} of {len(batch)} -- cancelled"
+                    self.marked.clear()
+                    self.pending_op = None
+                    self.rebuild()
+                    return
+            try:
+                if p.is_dir() and not p.is_symlink():
+                    shutil.rmtree(str(p))
+                else:
+                    p.unlink()  # rm semantics: removes a symlink itself, never its target
+            except (OSError, shutil.Error) as exc:
+                self.message = f"deleted {deleted} of {len(batch)} -- failed on {p.name}: {exc}"
+                self.marked.clear()
+                self.pending_op = None
+                self.rebuild()
+                return
+            deleted += 1
+        self.message = f"deleted {deleted} item{'s' if deleted != 1 else ''}"
+        self.marked.clear()
+        self.pending_op = None
+        self.rebuild()
+
     # -- render -----------------------------------------------------------
 
     def frame(self, cols: int, height: int) -> list[str]:
@@ -1364,8 +1446,9 @@ class Navigateur:
             letter = self.VERB_KEYS[verb]
             n = len(self.marked)
             mark = self.keys["mark"]
-            hint = (f"{verb} mode: {n} marked -- {mark} to mark, {letter} to {verb} here"
-                    if n else f"{verb} mode -- {mark} to mark, {letter} to {verb} here")
+            where = "" if verb == "delete" else " here"
+            hint = (f"{verb} mode: {n} marked -- {mark} to mark, {letter} to {verb}{where}"
+                    if n else f"{verb} mode -- {mark} to mark, {letter} to {verb}{where}")
         else:
             # Deliberately short. The full list used to live here and was
             # truncated segment by segment, so on a narrow terminal most of the
@@ -1641,9 +1724,15 @@ class Navigateur:
         if key in ("\x03", "\x04"):
             return True
 
-        # An armed row swallows the keypress first -- otherwise `q` could never
-        # be bound to anything, and typing a hex value would trip the panel's
-        # own navigation. ctrl-c/ctrl-d above still quit, as they do everywhere.
+        # An armed row swallows the keypress first, so that j/k/enter land in
+        # the edit rather than in the panel's own navigation. `q` is the one
+        # exception, tested above the bind branch: it is in RESERVED_KEYS, so
+        # _rebind() would only ever refuse it -- swallowing it there bought
+        # nothing and cost the documented "q always quits" invariant. The
+        # colour prompt below keeps the swallow, because there `q` is a
+        # character being typed into a text field, not a key being pressed.
+        if key == "q" and self.panel_edit != "color":
+            return True
         if self.panel_edit == "bind":
             self._rebind(key)
             return False
@@ -1653,14 +1742,15 @@ class Navigateur:
                 self.message = "unchanged"
             elif key == "ENTER":
                 self._recolor()
-            elif key == "\x7f":  # backspace, never past the leading '#'
+            elif key in ("\x7f", "\x08"):  # both backspaces: a terminal sends
+                # DEL or BS depending on its erase setting, and one of the two
+                # silently doing nothing in a typing prompt is maddening.
+                # Never past the leading '#'.
                 self.edit_buf = self.edit_buf[:1] or "#"
             elif len(key) == 1 and key.isprintable() and len(self.edit_buf) < 7:
                 self.edit_buf += key
             return False
 
-        if key == "q":
-            return True
         if key == "ESC":
             # One level at a time: a submenu falls back to the settings menu,
             # the settings menu (and the keys table) back to the tree.
@@ -1869,7 +1959,7 @@ class Navigateur:
                     else:
                         self.reveal_path(target)
                         self.message = f"went to bookmark {slot}"
-            elif action in ("op_move", "op_copy", "op_cut"):
+            elif action in ("op_move", "op_copy", "op_cut", "op_delete"):
                 verb = action[3:]
                 if self.pending_op != verb:
                     # Entering fresh, or switching verb mid-mark -- either way
@@ -1877,11 +1967,14 @@ class Navigateur:
                     self.pending_op = verb
                     n = len(self.marked)
                     mark = self.keys["mark"]
-                    self.message = (f"{n} marked -- {key} to {verb} here" if n
-                                     else f"{verb} mode -- {mark} to mark, {key} to {verb} here")
+                    where = "" if verb == "delete" else " here"
+                    self.message = (f"{n} marked -- {key} to {verb}{where}" if n
+                                     else f"{verb} mode -- {mark} to mark, {key} to {verb}{where}")
                 elif not self.marked:
                     self.pending_op = None
                     self.message = f"{verb} cancelled -- nothing marked"
+                elif verb == "delete":
+                    self.try_delete(screen, cols, height)
                 else:
                     self.try_op(screen, cols, height)
             elif action == "mark":

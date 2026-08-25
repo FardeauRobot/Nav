@@ -147,13 +147,14 @@ what the `source` line in your `.zshrc` is for.
 | `m` | enter **move mode**; `m` again moves everything marked to here (asks `y` to confirm) |
 | `c` | enter **copy mode**; `c` again copies everything marked to here (asks `y` to confirm) |
 | `x` | enter **cut mode**; `x` again relocates everything marked to here (asks `y` to confirm) -- the same operation as move, under its own key |
-| `e` | mark/unmark the current row, while in move, copy or cut mode |
+| `d` | enter **delete mode**; `d` again deletes everything marked, asking `y`/`Y` per item |
+| `e` | mark/unmark the current row, while in move, copy, cut or delete mode |
 | `F` | **lead** this window's group — its followers track this window |
 | `f` | **follow** this window's group — refused if nobody is leading it |
 | `?` | the full key table, laid out and grouped |
 | `,` | settings: your colours, your keys, your bookmarks |
 | `↵` | quit **and** cd your shell here |
-| `q` or `Esc` | quit, leaving your shell where it was — `Esc` instead cancels move/copy/cut mode if one is pending, or closes a panel, without quitting |
+| `q` or `Esc` | quit, leaving your shell where it was — `Esc` instead cancels move/copy/cut/delete mode if one is pending, or closes a panel, without quitting |
 | `Ctrl-C` / `Ctrl-D` | quit, same as `q` |
 
 The line at the bottom of the window is deliberately short — five keys, not
@@ -191,17 +192,25 @@ destination that's inside a folder you've marked, or that already has
 something by the same name, is refused with your marks intact, so you can
 just pick a different destination.
 
-Marks are shared across move, copy and cut: pressing a different verb's key
-while you already have marks switches the mode without losing them, so you
-can mark a batch, glance at `m`'s hint, then decide you actually wanted `c`
-or `x` instead — whichever of `m`/`c`/`x` you press second is what runs. Cut
-and move do the same thing to your files (relocate rather than duplicate);
-`x` exists as its own key/label for people who think in cut-and-paste terms,
-not because it behaves differently from `m`.
+Delete (`d`) confirms differently, since there's no destination to protect:
+the second `d` asks `y`/`N` once **per marked item**, not once for the whole
+batch — deleting a file you didn't mean to is worse than a stray move, so
+each one gets its own chance to say no. Press `Y` instead of `y` on any item
+to delete it and everything still left in the batch without asking again, for
+a deliberate large batch. Anything other than `y`/`Y` stops there and
+cancels the rest of the batch, same rule as move/copy/cut.
 
-`Esc` also gets you out of move/copy/cut mode at any point before the confirm
-prompt, dropping your marks without moving, copying or cutting anything — a
-quicker way out than pressing the verb key again with nothing marked.
+Marks are shared across move, copy, cut and delete: pressing a different
+verb's key while you already have marks switches the mode without losing
+them, so you can mark a batch, glance at `m`'s hint, then decide you actually
+wanted `c`, `x` or `d` instead — whichever verb key you press second is what
+runs. Cut and move do the same thing to your files (relocate rather than
+duplicate); `x` exists as its own key/label for people who think in
+cut-and-paste terms, not because it behaves differently from `m`.
+
+`Esc` also gets you out of move/copy/cut/delete mode at any point before the
+confirm prompt, dropping your marks without touching anything — a quicker way
+out than pressing the verb key again with nothing marked.
 
 Unbound keys do nothing — **except escape sequences**: only the four arrows are
 decoded, so PageUp, Home, End, the function keys and modified arrows all arrive
@@ -272,7 +281,9 @@ chsh -s /bin/zsh              # optional; or just run `zsh` when you want the br
 ```
 
 python3 older than 3.11 has no `tomllib`: everything works, but `config.toml`
-is ignored and the built-in colours apply.
+is ignored and the built-in colours apply. The settings panel still opens and
+still edits — the change is just real for that session only, and it says so
+rather than claiming a save you would lose at the next launch.
 
 ### `w` and `t` — which terminals can open a window or a tab
 
@@ -426,5 +437,5 @@ under `groups/`, so a window that was **already following** needs one
 
 ## Not in this first pass
 
-Fuzzy search, file operations (rename/delete), git-status decorations, a
-bash integration, and following across machines.
+Fuzzy search, rename, git-status decorations, a bash integration, and
+following across machines.

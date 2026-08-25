@@ -53,12 +53,26 @@ file.
 
 `python3 src/nav.py` run directly prints `navigateur: needs a terminal` and exits 2 unless
 **both** stdin and stdout are TTYs — so the usual "pipe it and read the output" smoke test
-cannot work here. Exercising a change means an interactive terminal — with one exception:
-the module *imports* fine, and `frame()` / `panel_frame()` are pure `(cols, height) ->
-list[str]`, so layout arithmetic can be checked headlessly. Point `NAV_STATE` at a temp
-directory first, load `src/nav.py` with `importlib`, and assert `len(frame(c, h)) == h`
-plus every ANSI-stripped line fitting in `c`, at both 40x8 and something large.
-`ast.parse` alone catches none of that.
+cannot work here. Two harnesses do work, and they reach different layers:
+
+- **Import it.** The module imports fine, and `frame()` / `panel_frame()` are pure
+  `(cols, height) -> list[str]`, so layout arithmetic, the keymap and the config writer can
+  all be asserted headlessly. Point `NAV_STATE` at a temp directory first — or the harness
+  edits your real `~/.navigateur/config.toml` — load `src/nav.py` with `importlib`, and
+  assert `len(frame(c, h)) == h` plus every ANSI-stripped line fitting in `c`, at both 40x8
+  and something large. `ast.parse` alone catches none of that.
+- **Give it a pty.** `pty.fork()` provides genuine TTYs on both fds, so the whole program
+  runs and can be driven with `os.write`. This is the only way to reach `Screen.paint()`'s
+  diff, the `SIGWINCH` path and `Screen.key()`'s escape decoding. Two traps: replay the
+  output into a **persistent** grid, because `paint()` emits only the lines it thinks
+  changed — one frame's bytes are a delta, not a picture, and a per-frame grid reports every
+  unchanged row as blank, which quietly turns box-alignment checks into no-ops. And keep
+  draining the pty while the child exits, or it blocks writing its restore sequences into a
+  full buffer and looks like a program that refused to quit.
+
+Neither replaces a look in a real terminal: `len()` is not display width, so a glyph that
+renders double-width (an emoji-presentation `⌨`, say) passes both harnesses and tears the
+box on screen.
 
 Shared state lives under `$NAV_STATE` (default `~/.navigateur`; overridable, see
 `src/nav.zsh:12` and `src/nav.py:35`): `config.toml`, `roles/<tty>`, and per group
@@ -189,7 +203,8 @@ and the move/copy/cut messages read `self.keys["mark"]` rather than spelling `e`
 
 - **Rows with `action = None` are the fixed keys** — `↵`, `esc`, `q`, `^c`/`^d`. They are
   displayed but never rebindable, and `RESERVED_KEYS` refuses them (plus the digits, which
-  `B`/`b` read as bookmark slots). This is `load_config()`'s rule applied to keys: a typo
+  `B`/`b` read as bookmark slots **and** `count_buf` reads as a repeat count — two
+  independent reasons, so removing either one does not free the digits). This is `load_config()`'s rule applied to keys: a typo
   must never cost you the browser you would use to fix it, so the way *out* is never
   something the user can spell wrong. Arrows are in `ARROW_KEYS`, applied over the user's
   bindings in `_build_binds()`, so rebinding `down` cannot steal `↓`.
@@ -199,7 +214,11 @@ and the move/copy/cut messages read `self.keys["mark"]` rather than spelling `e`
   paint path, one input path. `read_slot()` is modal *input* only (a single blocking read);
   a panel needs a loop, which is why it is a mode instead.
 - **`_panel_key()` is called above the `count_buf` block in `run()`**, because that block
-  eats every digit and the bookmarks panel is indexed by digit.
+  eats every digit and the bookmarks panel *is* indexed by digit: `_panel_key()` has an
+  explicit `mode == "bookmarks" and key in "0123456789"` branch that jumps to the slot,
+  reusing `b`'s idiom now that the slots are on screen. Move the call below `count_buf` and
+  that branch becomes unreachable rather than wrong — nothing fails, the digits just stop
+  working.
 - **`q` quits from inside a panel; `esc` closes it.** Deliberately not the pager
   convention. `q` is the one key in this file with no second meaning anywhere, and `ESC`
   already carries the context-sensitive one (cancel a pending op / back out a level).
@@ -246,8 +265,23 @@ is not a reason to hand-roll a serialiser.
   in the same keystroke. Colours are applied by mutating `self.colors`, which is the dict
   every `fg()`/`bg()` call already reads — nothing to relaunch, and the panel is honest
   about the difference if the *write* fails but the in-memory change stuck.
-- **An armed edit row swallows the keypress before any panel navigation**, which is the
-  only reason `q` can be bound to something. `^c`/`^d` are checked above even that.
+- **An armed edit row swallows the keypress before any panel navigation** — otherwise
+  `j`/`k`/`↵` would move the panel's cursor instead of landing in the edit. `^c`/`^d` are
+  checked above even that. **`q` is excepted out of the bind branch by hand**, and the
+  exception is load-bearing rather than tidy-up: `q` is in `RESERVED_KEYS`, so `_rebind()`
+  can only ever *refuse* it — swallowing it bought nothing and quietly cost the
+  `q`-always-quits invariant the README states with no exception. The colour prompt keeps
+  the swallow (`self.panel_edit != "color"`), because there `q` is a character being typed
+  into a text field, not a key being pressed. An earlier version of this bullet claimed the
+  swallow was "the only reason `q` can be bound to something", which was never true and is
+  exactly the kind of stated-but-false rationale this file exists to prevent.
+- **Without `tomllib`, saving is a lie the panel has to admit.** `load_config()` returns
+  early on python < 3.11, so the file is never read back — but `write_config_value()` still
+  succeeds, and a bare "dir is now #83a598" would promise a setting that is gone at the next
+  launch. `SESSION_ONLY` (module level, next to the import that causes it) is appended to
+  both success messages and is the empty string everywhere else. This is the same
+  degrade-honestly rule as the rest of `load_config()`, applied to a message instead of a
+  value.
 
 ## Cross-file invariants
 
@@ -286,6 +320,23 @@ Each of these looks like removable noise and is load-bearing:
   repaints only changed lines; full clears flicker. `SIGWINCH` and a size change just blank
   `prev` to force a repaint. `measure()` clamps to 40x8 because a terminal reporting 0x0
   mid-resize would otherwise render an empty screen.
+- **`SIGWINCH` needs the self-pipe to mean anything.** Blanking `prev` only takes effect at
+  the top of `run()`'s loop, and the loop is parked in `os.read()` on the keyboard. PEP 475
+  restarts that read once the handler returns normally, so the handler alone left the window
+  resized and the frame stale until the user happened to press a key — `key()`'s
+  `except InterruptedError: return None` branch was the intended contract and simply never
+  fired. `Screen.__enter__` registers `signal.set_wakeup_fd` on a non-blocking pipe and
+  `key()` selects on **the keyboard and that pipe**, so a signal returns `None` and the loop
+  repaints. Consequences: `key()` now selects even when `timeout is None`; `restore()` must
+  `set_wakeup_fd(-1)` *before* closing either end, or a signal arriving afterwards prints
+  "Exception ignored" over the restored screen; `warn_on_full_buffer=False` is not optional,
+  since the default writes that warning to **stderr, which here is the alt screen** — the
+  same rule as "stdout is the display, never a data channel", and a dropped wakeup byte only
+  costs one late repaint; and the whole thing is wrapped so a failure degrades to the old
+  press-a-key behaviour rather than costing you the browser.
+- **Both backspaces erase.** The colour prompt accepts `\x7f` **and** `\x08` — which one a
+  terminal sends depends on its erase setting, and a typing prompt where the erase key
+  silently does nothing is the kind of bug nobody reports and everybody hates.
 - **Config degrades key by key.** `load_config()` type-checks each key over `DEFAULTS`; a
   typo must never cost you the browser you would use to fix it. Adding a setting means
   touching `DEFAULTS`, `DEFAULT_CONFIG_TEXT` and the README table together — and note
@@ -294,43 +345,65 @@ Each of these looks like removable noise and is load-bearing:
 - **Colours are plain 24-bit hex, not palette slots.** That is the reason this is raw ANSI
   rather than curses. Keep it that way.
 
-## Move/copy/cut mode: the first code that mutates the browsed tree
+## Move/copy/cut/delete mode: the first code that mutates the browsed tree
 
 Everything else `nav.py` writes is bookkeeping under `$NAV_STATE` — bookmarks, roles, group
-`cwd` files. `do_move()`/`do_copy()` are the only places the browser changes what it is
-showing you, via `shutil.move()`/`shutil.copy2()`/`shutil.copytree()`, and the invariants
-below exist because a mistake here loses a user's files rather than corrupting a scratch
-file that a restart repairs.
+`cwd` files. `do_move()`/`do_copy()`/`try_delete()` are the only places the browser changes
+what it is showing you, via `shutil.move()`/`shutil.copy2()`/`shutil.copytree()`/
+`shutil.rmtree()`/`Path.unlink()`, and the invariants below exist because a mistake here loses
+a user's files rather than corrupting a scratch file that a restart repairs.
 
-`self.pending_op` is `None | "move" | "copy" | "cut"` — one state machine, not three. `m`,
-`c` and `x` all funnel into the same `toggle_mark()` / `_op_batch()` / `try_op()` path; the
-only thing that reads `pending_op`'s specific value is the confirm-prompt wording and, at the
-very end, `try_op()`'s dispatch between `do_move()` and `do_copy()`. **Cut is move**, not a
-third filesystem operation: `try_op()` routes both `"move"` and `"cut"` to `do_move()`, and
-`do_move()` takes a `verb` parameter used *only* to spell "moved" vs "cut" in the outcome
-message. There is deliberately no `do_cut()`. This was an explicit user choice — the first ask
-was answered by pointing out `m` already does what "cut" means (relocate, not duplicate), and
-the user later asked for `x` as a real key anyway, for people who think in cut/paste terms;
-what they did not ask for, and what would be a mistake to build, is a second code path that
-could drift from move's collision/nesting guarantees.
+`self.pending_op` is `None | "move" | "copy" | "cut" | "delete"` — one state machine, not
+four. `m`, `c`, `x` and `d` all funnel into the same `toggle_mark()` path; `marked`/
+`pending_op` themselves don't distinguish delete from the other three. Only two things read
+`pending_op`'s specific value: the confirm-prompt wording (`toggle_mark()`, `_hint_line()`,
+`run()`'s dispatch — all three use the same `where = "" if verb == "delete" else " here"`
+substitution rather than duplicating the message-building code) and, in `run()`'s dispatch
+block, which second-press method runs. **Delete does not share `_op_batch()`/`try_op()`** —
+it has its own `_delete_batch()` (nested-mark collapse only, no destination to check for
+collisions or nesting-into-itself) and `try_delete()` (see below), because there is no
+destination for a delete to collide with or land in. **Cut is move**, not a third filesystem
+operation: `try_op()` routes both `"move"` and `"cut"` to `do_move()`, and `do_move()` takes a
+`verb` parameter used *only* to spell "moved" vs "cut" in the outcome message. There is
+deliberately no `do_cut()`. This was an explicit user choice — the first ask was answered by
+pointing out `m` already does what "cut" means (relocate, not duplicate), and the user later
+asked for `x` as a real key anyway, for people who think in cut/paste terms; what they did not
+ask for, and what would be a mistake to build, is a second code path that could drift from
+move's collision/nesting guarantees.
 
 - **`self.marked` and `self.pending_op` are one state, not two.** `marked` is non-empty only
-  while `pending_op` is set; every exit path — a successful move/copy/cut, a partial failure, a
-  destination refusal that lets the user retry, and a non-`y` cancel — clears both together.
-  Neither is ever written to disk, so quitting the browser mid-operation discards marks exactly
-  like every other in-memory field.
-- **Marks are shared across all three verbs, on purpose.** Pressing a different verb key while
+  while `pending_op` is set; every exit path — a successful move/copy/cut/delete, a partial
+  failure, a destination refusal that lets the user retry, and a non-`y` cancel — clears both
+  together. Neither is ever written to disk, so quitting the browser mid-operation discards
+  marks exactly like every other in-memory field.
+- **Marks are shared across all four verbs, on purpose.** Pressing a different verb key while
   marks already exist switches `pending_op` rather than executing anything — the user can mark
-  a batch under `m`, glance at the hint, and switch to `c` or `x` before ever confirming. This
-  falls out of the state machine for free; resist the urge to "fix" it into locking the verb at
-  entry, since that needs an extra branch and a special-case message for no behavioural gain —
-  the `y` prompt already names the verb and the destination, so a fat-fingered switch is visible
-  before anything happens.
-- **`VERB_KEYS = {"move": "m", "copy": "c", "cut": "x"}`** (class attribute) is the one place
+  a batch under `m`, glance at the hint, and switch to `c`, `x` or `d` before ever confirming.
+  This falls out of the state machine for free; resist the urge to "fix" it into locking the
+  verb at entry, since that needs an extra branch and a special-case message for no behavioural
+  gain — the confirm prompt already names the verb (and, for move/copy/cut, the destination),
+  so a fat-fingered switch is visible before anything happens.
+- **`VERB_KEYS` is now `{"move": "m", "copy": "c", "cut": "x", "delete": "d"}`** (a property
+  derived from `self.keys`, not a literal dict — see the keymap section above) — the one place
   that maps a verb to its key. Earlier, when only move/copy existed, message text derived the
   key letter as `verb[0]` — that stopped working the moment `x`/`"cut"` existed, since `"copy"`
-  and `"cut"` both start with `c`. Don't reintroduce a `verb[0]`-style shortcut if a fourth verb
+  and `"cut"` both start with `c`. Don't reintroduce a `verb[0]`-style shortcut if a fifth verb
   is ever added; extend the table instead.
+- **Delete confirms per item, not once for the whole batch.** `try_delete()` loops the batch
+  and calls `read_slot()` again for each item: `y` deletes this one and advances, `Y` deletes
+  this one and every item still left without asking again, anything else stops the rest of the
+  batch (same "anything but y cancels" rule as `try_op()`, just scoped to what's left rather
+  than the whole operation, since items already deleted can't be un-deleted by a late cancel).
+  This is a deliberate divergence from move/copy/cut's single whole-batch prompt, per an
+  explicit user request: a mis-click during a large delete is worse than during a move (nothing
+  survives to go clean up), so it should cost one keystroke to catch, not zero — while `Y`
+  keeps a genuinely large, deliberate batch from being one keypress per file. `_delete_batch()`
+  is `_op_batch()`'s nested-mark-collapse step alone, deliberately not a call to `_op_batch()`
+  with a fake destination, since delete has no destination and none of `_op_batch()`'s
+  collision/lexists checks apply. Symlink handling: `p.is_dir() and not p.is_symlink()` routes
+  to `shutil.rmtree()`, else `p.unlink()` — `shutil.rmtree()` itself refuses to operate on a
+  symlink, and `rm` semantics (remove the link, never dereference into its target) is the
+  correct and expected behavior for an irreversible delete.
 - **The collision preflight is all-or-nothing, checked before any `shutil.move`/`shutil.copy2`/
   `shutil.copytree` call runs.** `_op_batch()` walks the whole batch — nested-mark collapse,
   duplicate basenames *within the batch itself* (two marked files that happen to share a name
