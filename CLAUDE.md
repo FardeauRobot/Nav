@@ -15,9 +15,24 @@ file would break by accident.
 nothing** — `nav.zsh` self-locates via `NAV_HOME=${${(%):-%x}:A:h}`, so there is
 no path to substitute and no second copy to drift. It is therefore the third
 place that has to agree on where `nav.zsh` lives (with the README and the rc
-file); its idempotence check is `grep -F` on that absolute path, so moving or
-renaming the clone makes a re-run add a *second* line rather than recognise the
-first. `--uninstall` removes the block, deliberately leaving `$NAV_STATE` alone.
+file); `find_nav_line()` is the one place that decides whether an rc line is
+"ours": it resolves any existing `source .../nav.zsh` line to a real path
+(`cd`+`pwd -P`, the same rule `$REPO` uses) and compares that, not the literal
+text — so a line spelled differently from what `install.sh` itself writes
+(tilde vs absolute, quoted vs not) is still recognised as the same clone.
+Install, `--dry-run` and `--uninstall` all call it, which is what keeps them
+agreeing — a `--dry-run` that predicted "would append" while a real run right
+after it silently no-op'd would be its own bug. `find_nav_line()` sits on top
+of `classify_nav_lines()`, which tags every `nav.zsh` line in the rc file
+`ours` / `other` / `dangling` (target doesn't exist — the tell for a clone
+moved or renamed since that line was written); the install-time "you already
+source another nav.zsh" notice reads that classification too, so a dangling
+line is reported honestly as a stale line from this same clone rather than
+claimed to be a competing copy. It still can't *repair* the install once the
+clone has moved — the old line's target is gone, so nothing resolves it to
+`ours` — a re-run adds a fresh, correct second line alongside the dead one
+rather than editing the first in place. `--uninstall` drops the resolved line
+plus its marker and leading blank, deliberately leaving `$NAV_STATE` alone.
 
 ```sh
 ./install.sh                # or: sh install.sh, --uninstall, --dry-run

@@ -21,6 +21,56 @@ NAV_ZSH="$REPO/src/nav.zsh"
 die() { printf '%s\n' "install.sh: $*" >&2; exit 1; }
 note() { printf '%s\n' "$*"; }
 
+# For every `source .../nav.zsh` (or `. .../nav.zsh`) line in $RC, print one
+# `<status> <lineno>` row: `ours` if the line resolves (same `cd`+`pwd -P`
+# rule $REPO used above) to $NAV_ZSH, `other` if it resolves to a real but
+# different file, `dangling` if the target no longer exists at all -- the
+# tell for a clone that was later moved or renamed, as opposed to a genuinely
+# separate install.  A literal grep on $NAV_ZSH would only catch a line
+# spelled exactly the way this script writes it (quoted, absolute); a line
+# sourcing the same clone written differently -- unquoted, tilde-form --
+# wouldn't match, so a re-run would append a harmless-looking but real
+# duplicate, and --uninstall would report nothing to remove.  Shared by the
+# install-time check, --dry-run, --uninstall and the "another copy" notice,
+# so all four agree on what a given line actually is.
+classify_nav_lines() {
+  [ -f "$RC" ] || return 0
+  matches=$(grep -Fn 'nav.zsh' "$RC" 2>/dev/null) || return 0
+  [ -n "$matches" ] || return 0
+  tmp_matches=$(mktemp "${TMPDIR:-/tmp}/navigateur.XXXXXX")
+  printf '%s\n' "$matches" > "$tmp_matches"
+  while IFS=: read -r lineno rest; do
+    # Two seds, not one `\(source\|\.\)` alternation: BSD sed (macOS's
+    # /bin/sh) has no `\|`, and silently leaves an unmatched line untouched
+    # rather than erroring, which would make this whole check a no-op.
+    candidate=$(printf '%s\n' "$rest" | sed \
+      -e 's/^[[:space:]]*source[[:space:]][[:space:]]*//' \
+      -e 's/^\.[[:space:]][[:space:]]*//' \
+      -e 's/^"\(.*\)"$/\1/' -e "s/^'\\(.*\\)'\$/\\1/")
+    case $candidate in
+      '~') candidate="$HOME" ;;
+      '~/'*) candidate="$HOME/${candidate#'~/'}" ;;
+    esac
+    if [ ! -e "$candidate" ]; then
+      printf 'dangling %s\n' "$lineno"
+      continue
+    fi
+    resolved=$(CDPATH= cd -- "$(dirname -- "$candidate")" 2>/dev/null &&
+      printf '%s/%s\n' "$(pwd -P)" "$(basename -- "$candidate")") || continue
+    if [ "$resolved" = "$NAV_ZSH" ]; then
+      printf 'ours %s\n' "$lineno"
+    else
+      printf 'other %s\n' "$lineno"
+    fi
+  done < "$tmp_matches"
+  rm -f "$tmp_matches"
+}
+
+# The first line that's actually this clone, or nothing.
+find_nav_line() {
+  classify_nav_lines | awk '$1 == "ours" { print $2; exit }'
+}
+
 [ -f "$NAV_ZSH" ] || die "can't find src/nav.zsh next to this script ($REPO).
 Run install.sh from inside the cloned repo."
 
@@ -54,18 +104,22 @@ done
 
 if [ "$MODE" = uninstall ]; then
   [ -f "$RC" ] || { note "nothing to do: $RC does not exist"; exit 0; }
-  if ! grep -Fq "$NAV_ZSH" "$RC"; then
+  target=$(find_nav_line)
+  if [ -z "$target" ]; then
     note "nothing to do: $RC does not source $NAV_ZSH"
     exit 0
   fi
   # Never edit in place -- a truncated rc file is a shell that won't start.
   tmp=$(mktemp "${TMPDIR:-/tmp}/navigateur.XXXXXX")
   trap 'rm -f "$tmp"' EXIT
-  # Drops our two lines *and* the blank line install.sh put in front of them --
-  # otherwise an install/uninstall cycle leaves one blank behind every time.
-  awk -v navzsh="$NAV_ZSH" -v marker="$MARKER" '
-    { line[NR] = $0; drop[NR] = (index($0, navzsh) || $0 == marker) }
+  # Drops the resolved line, the marker directly above it, *and* the blank
+  # line install.sh put in front of them -- otherwise an install/uninstall
+  # cycle leaves one blank behind every time.
+  awk -v marker="$MARKER" -v target="$target" '
+    { line[NR] = $0 }
     END {
+      drop[target] = 1
+      if (line[target-1] == marker) drop[target-1] = 1
       for (i = 1; i <= NR; i++)
         if (drop[i] && i > 1 && line[i-1] == "" && !drop[i-1]) { drop[i-1] = 1; break }
       for (i = 1; i <= NR; i++) if (!drop[i]) print line[i]
@@ -106,11 +160,20 @@ fi
 
 LINE="source \"$NAV_ZSH\""
 
+# Computed before --dry-run branches on it, so a dry run reports the same
+# thing a real run would do -- rather than always claiming it would append,
+# even when the real run below would recognise an existing line and no-op.
+target=$(find_nav_line)
+
 if [ "$MODE" = dryrun ]; then
-  note "would append to $RC:"
-  note ""
-  note "$MARKER"
-  note "$LINE"
+  if [ -n "$target" ]; then
+    note "already installed -- $RC already sources $NAV_ZSH"
+  else
+    note "would append to $RC:"
+    note ""
+    note "$MARKER"
+    note "$LINE"
+  fi
   exit 0
 fi
 
@@ -118,22 +181,28 @@ fi
 
 [ -f "$RC" ] || { : > "$RC"; note "created $RC"; }
 
-# -F, not a plain grep: a repo path is not a regular expression, and a `+` or
-# `[` in a directory name would otherwise make this check lie.
-if grep -Fq "$NAV_ZSH" "$RC"; then
+if [ -n "$target" ]; then
   note "already installed -- $RC already sources $NAV_ZSH"
   note "run  exec zsh  if you haven't since, then type  navigate"
   exit 0
 fi
 
-# A different copy of navigateur already sourced?  Say so and carry on: an
-# installer that stops to ask is worse than either outcome, and the overlap is
-# harmless -- the second source just redefines nav(), and the hooks go in via
-# add-zsh-hook, which de-dupes by function name.
-if grep -Fq 'nav.zsh' "$RC"; then
+# A different copy of navigateur already sourced, or a stale line left behind
+# by a clone that was later moved/renamed?  Say so and carry on either way --
+# an installer that stops to ask is worse than either outcome, and a second
+# real source is harmless (the second source just redefines nav(), and the
+# hooks go in via add-zsh-hook, which de-dupes by function name).  The two
+# cases get different wording: calling a dead line "another" copy would be
+# actively wrong for the moved-clone case classify_nav_lines exists to catch.
+classification=$(classify_nav_lines)
+if printf '%s\n' "$classification" | grep -q '^other '; then
   note "note: $RC already sources another nav.zsh:"
   grep -Fn 'nav.zsh' "$RC" | sed 's/^/      /'
   note "      adding this one too; the last one sourced wins."
+elif printf '%s\n' "$classification" | grep -q '^dangling '; then
+  note "note: $RC has a nav.zsh line pointing at a path that no longer exists"
+  note "      (probably this clone, moved or renamed) -- adding the current one:"
+  grep -Fn 'nav.zsh' "$RC" | sed 's/^/      /'
 fi
 
 printf '\n%s\n%s\n' "$MARKER" "$LINE" >> "$RC"
