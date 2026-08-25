@@ -358,12 +358,12 @@ spacing alone:
 # in the browser -- it patches the one line it changes and leaves the rest be.
 
 [colors]
-accent      = "#d97757"   # the ❯ caret and the active root
-dir         = "#7aa2f7"
-file        = "#c0caf5"
-dim         = "#565f89"   # hints, counts, disclosure triangles
-border      = "#3b4261"
-selected_bg = "#292e42"
+accent      = "#fe8019"   # the ❯ caret and the active root
+dir         = "#83a598"
+file        = "#ebdbb2"
+dim         = "#928374"   # hints, counts, disclosure triangles
+border      = "#504945"
+selected_bg = "#3c3836"
 
 [behavior]
 show_hidden    = false

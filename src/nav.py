@@ -32,6 +32,13 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - 3.11+ has it
     tomllib = None
 
+# Without tomllib the settings panel can still *write* config.toml, but
+# load_config() will never read it back -- so a rebind or a recolour is real for
+# this session and silently gone at the next launch. Say so rather than
+# reporting a success the user will not get: the same "degrade honestly" rule
+# load_config() follows key by key.
+SESSION_ONLY = "" if tomllib else "  (this session only -- python < 3.11)"
+
 STATE = Path(os.environ.get("NAV_STATE", str(Path.home() / ".navigateur")))
 ROLES = STATE / "roles"
 GROUPS = STATE / "groups"
@@ -97,12 +104,12 @@ DEFAULT_CONFIG_TEXT = '''\
 # in the browser -- it patches the one line it changes and leaves the rest be.
 
 [colors]
-accent      = "#d97757"   # the caret, the active root
-dir         = "#7aa2f7"
-file        = "#c0caf5"
-dim         = "#565f89"   # hints, counts, disclosure triangles
-border      = "#3b4261"
-selected_bg = "#292e42"
+accent      = "#fe8019"   # the caret, the active root
+dir         = "#83a598"
+file        = "#ebdbb2"
+dim         = "#928374"   # hints, counts, disclosure triangles
+border      = "#504945"
+selected_bg = "#3c3836"
 
 [behavior]
 show_hidden    = false
@@ -111,12 +118,12 @@ follow_default = false   # start this window as the leader
 
 DEFAULTS = {
     "colors": {
-        "accent": "#d97757",
-        "dir": "#7aa2f7",
-        "file": "#c0caf5",
-        "dim": "#565f89",
-        "border": "#3b4261",
-        "selected_bg": "#292e42",
+        "accent": "#fe8019",
+        "dir": "#83a598",
+        "file": "#ebdbb2",
+        "dim": "#928374",
+        "border": "#504945",
+        "selected_bg": "#3c3836",
     },
     "behavior": {"show_hidden": False, "follow_default": False},
 }
@@ -346,12 +353,12 @@ def _save_config(lines: list[str]) -> bool:
     return True
 
 
-def fg(hexcolor: str, fallback: str = "#c0caf5") -> str:
+def fg(hexcolor: str, fallback: str = "#ebdbb2") -> str:
     r, g, b = _rgb(hexcolor, fallback)
     return f"\x1b[38;2;{r};{g};{b}m"
 
 
-def bg(hexcolor: str, fallback: str = "#292e42") -> str:
+def bg(hexcolor: str, fallback: str = "#3c3836") -> str:
     r, g, b = _rgb(hexcolor, fallback)
     return f"\x1b[48;2;{r};{g};{b}m"
 
@@ -598,6 +605,7 @@ class Screen:
         self.prev: list[str] = []
         self.rows = 24
         self.cols = 80
+        self.wake = -1
 
     def __enter__(self) -> "Screen":
         self.saved = termios.tcgetattr(self.fd)
@@ -607,6 +615,22 @@ class Screen:
         for sig in (signal.SIGTERM, signal.SIGHUP):
             signal.signal(sig, self._bail)
         signal.signal(signal.SIGWINCH, self._resized)
+        # A self-pipe, because a signal alone cannot wake the read below.
+        # PEP 475 restarts an interrupted syscall once the handler returns
+        # normally, so _resized() would blank prev and then the process would
+        # sit in os.read() until the user happened to press something -- the
+        # window resized and the frame stale until then. set_wakeup_fd makes
+        # the signal a readable byte, which select() can wait on alongside the
+        # keyboard. key()'s existing InterruptedError branch shows this was
+        # always the contract; it just never fired.
+        try:
+            read_fd, write_fd = os.pipe()
+            os.set_blocking(read_fd, False)
+            os.set_blocking(write_fd, False)
+            signal.set_wakeup_fd(write_fd)
+            self.wake = read_fd
+        except (OSError, ValueError):
+            self.wake = -1  # degrade to the old behaviour, never to no browser
         return self
 
     def __exit__(self, *exc) -> None:
@@ -615,6 +639,17 @@ class Screen:
     def restore(self) -> None:
         sys.stdout.write("\x1b[?25h\x1b[?1049l" + RESET)
         sys.stdout.flush()
+        if self.wake >= 0:
+            # Unregister before closing: a signal delivered after the write end
+            # is gone would print "Exception ignored" over the restored screen.
+            try:
+                write_fd = signal.set_wakeup_fd(-1)
+                os.close(self.wake)
+                if write_fd >= 0:
+                    os.close(write_fd)
+            except (OSError, ValueError):
+                pass
+            self.wake = -1
         if self.saved is not None:
             termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
             self.saved = None
@@ -655,10 +690,21 @@ class Screen:
 
     def key(self, timeout: float | None = None) -> str | None:
         """timeout is how a follower stays responsive to the leader while
-        nobody is typing: select first, and report None when it expires."""
-        if timeout is not None:
-            r, _, _ = select.select([self.fd], [], [], timeout)
+        nobody is typing: select first, and report None when it expires.
+
+        Waiting on the wakeup pipe as well as the keyboard is what lets a
+        SIGWINCH return None from here, so run() loops round and repaints at
+        the new size instead of blocking until the next keypress."""
+        watch = [self.fd] + ([self.wake] if self.wake >= 0 else [])
+        if timeout is not None or self.wake >= 0:
+            r, _, _ = select.select(watch, [], [], timeout)
             if not r:
+                return None
+            if self.fd not in r:
+                try:  # a signal, not a key: drain it and let run() repaint
+                    os.read(self.wake, 1024)
+                except OSError:
+                    pass
                 return None
         try:
             ch = os.read(self.fd, 1)
@@ -1518,10 +1564,10 @@ class Navigateur:
             return
         self.keys[action] = key
         self.binds = self._build_binds()  # rebuild, don't patch: the old key
-        if write_config_value("keys", action, key):  # must stop working at once
-            self.message = f"{ACTION_DESC[action]} is now {key}"
-        else:
+        if not write_config_value("keys", action, key):  # must stop working at once
             self.message = f"{key} works now, but config.toml could not be written"
+        else:
+            self.message = f"{ACTION_DESC[action]} is now {key}{SESSION_ONLY}"
 
     def _recolor(self) -> None:
         """↵ on a colour being typed. Applied live -- self.colors is the dict
@@ -1535,7 +1581,7 @@ class Navigateur:
             return
         self.colors[name] = value
         if write_config_value("colors", name, value):
-            self.message = f"{name} is now {value}"
+            self.message = f"{name} is now {value}{SESSION_ONLY}"
         else:
             self.message = f"{name} is {value} for now -- config.toml is unwritable"
 
@@ -1625,7 +1671,13 @@ class Navigateur:
         body, _footer = self._panel_content()
         last = max(0, len(body) - 1)
         action = self.binds.get(key)
-        if action == "down":
+        if self.mode == "bookmarks" and key in "0123456789":
+            # The same `b`+digit idiom, reused where the slots are on screen --
+            # and the concrete reason this handler has to sit above run()'s
+            # count buffer, which otherwise eats every digit before we see it.
+            self.panel_cursor = int(key)
+            self._panel_open()
+        elif action == "down":
             # The keys table has no cursor, so j/k scroll it directly; every
             # other panel has a flat body and moves a real selection.
             if self.mode in self.CURSOR_PANELS:
