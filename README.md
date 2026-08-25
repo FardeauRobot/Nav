@@ -144,10 +144,14 @@ what the `source` line in your `.zshrc` is for.
 | `t` | open this folder in a new terminal **tab** |
 | `B` then `0`-`9` | bookmark the folder you're on under that digit |
 | `b` then `0`-`9` | go to that bookmark |
+| `m` | enter **move mode**; `m` again moves everything marked to here (asks `y` to confirm) |
+| `c` | enter **copy mode**; `c` again copies everything marked to here (asks `y` to confirm) |
+| `x` | enter **cut mode**; `x` again relocates everything marked to here (asks `y` to confirm) -- the same operation as move, under its own key |
+| `e` | mark/unmark the current row, while in move, copy or cut mode |
 | `F` | **lead** this window's group — its followers track this window |
 | `f` | **follow** this window's group — refused if nobody is leading it |
 | `↵` | quit **and** cd your shell here |
-| `q` or `Esc` | quit, leaving your shell where it was |
+| `q` or `Esc` | quit, leaving your shell where it was — `Esc` instead cancels move/copy/cut mode if one is pending, without quitting |
 | `Ctrl-C` / `Ctrl-D` | quit, same as `q` |
 
 `F` and `f` toggle: pressing either again returns the window to solo. They
@@ -155,7 +159,26 @@ take no argument, so they act on the group the window is already in — they
 never yank you back to `default`.
 
 At the `B`/`b` digit prompt, any key that isn't a digit cancels (`Ctrl-C` and
-`Ctrl-D` still quit).
+`Ctrl-D` still quit). The move, copy and cut confirm prompts (the second `m`,
+`c` or `x`) work the same way: anything other than `y` cancels the whole
+operation and clears your marks (`Ctrl-C`/`Ctrl-D` still quit). You can
+navigate freely between marks — expand, collapse, jump around — nothing
+happens until that second `m`/`c`/`x` and the `y` that follows it. A
+destination that's inside a folder you've marked, or that already has
+something by the same name, is refused with your marks intact, so you can
+just pick a different destination.
+
+Marks are shared across move, copy and cut: pressing a different verb's key
+while you already have marks switches the mode without losing them, so you
+can mark a batch, glance at `m`'s hint, then decide you actually wanted `c`
+or `x` instead — whichever of `m`/`c`/`x` you press second is what runs. Cut
+and move do the same thing to your files (relocate rather than duplicate);
+`x` exists as its own key/label for people who think in cut-and-paste terms,
+not because it behaves differently from `m`.
+
+`Esc` also gets you out of move/copy/cut mode at any point before the confirm
+prompt, dropping your marks without moving, copying or cutting anything — a
+quicker way out than pressing the verb key again with nothing marked.
 
 Unbound keys do nothing — **except escape sequences**: only the four arrows are
 decoded, so PageUp, Home, End, the function keys and modified arrows all arrive
@@ -354,5 +377,5 @@ under `groups/`, so a window that was **already following** needs one
 
 ## Not in this first pass
 
-Fuzzy search, file operations (rename/delete/move), git-status decorations, a
+Fuzzy search, file operations (rename/delete), git-status decorations, a
 bash integration, and following across machines.

@@ -212,6 +212,96 @@ Each of these looks like removable noise and is load-bearing:
 - **Colours are plain 24-bit hex, not palette slots.** That is the reason this is raw ANSI
   rather than curses. Keep it that way.
 
+## Move/copy/cut mode: the first code that mutates the browsed tree
+
+Everything else `nav.py` writes is bookkeeping under `$NAV_STATE` — bookmarks, roles, group
+`cwd` files. `do_move()`/`do_copy()` are the only places the browser changes what it is
+showing you, via `shutil.move()`/`shutil.copy2()`/`shutil.copytree()`, and the invariants
+below exist because a mistake here loses a user's files rather than corrupting a scratch
+file that a restart repairs.
+
+`self.pending_op` is `None | "move" | "copy" | "cut"` — one state machine, not three. `m`,
+`c` and `x` all funnel into the same `toggle_mark()` / `_op_batch()` / `try_op()` path; the
+only thing that reads `pending_op`'s specific value is the confirm-prompt wording and, at the
+very end, `try_op()`'s dispatch between `do_move()` and `do_copy()`. **Cut is move**, not a
+third filesystem operation: `try_op()` routes both `"move"` and `"cut"` to `do_move()`, and
+`do_move()` takes a `verb` parameter used *only* to spell "moved" vs "cut" in the outcome
+message. There is deliberately no `do_cut()`. This was an explicit user choice — the first ask
+was answered by pointing out `m` already does what "cut" means (relocate, not duplicate), and
+the user later asked for `x` as a real key anyway, for people who think in cut/paste terms;
+what they did not ask for, and what would be a mistake to build, is a second code path that
+could drift from move's collision/nesting guarantees.
+
+- **`self.marked` and `self.pending_op` are one state, not two.** `marked` is non-empty only
+  while `pending_op` is set; every exit path — a successful move/copy/cut, a partial failure, a
+  destination refusal that lets the user retry, and a non-`y` cancel — clears both together.
+  Neither is ever written to disk, so quitting the browser mid-operation discards marks exactly
+  like every other in-memory field.
+- **Marks are shared across all three verbs, on purpose.** Pressing a different verb key while
+  marks already exist switches `pending_op` rather than executing anything — the user can mark
+  a batch under `m`, glance at the hint, and switch to `c` or `x` before ever confirming. This
+  falls out of the state machine for free; resist the urge to "fix" it into locking the verb at
+  entry, since that needs an extra branch and a special-case message for no behavioural gain —
+  the `y` prompt already names the verb and the destination, so a fat-fingered switch is visible
+  before anything happens.
+- **`VERB_KEYS = {"move": "m", "copy": "c", "cut": "x"}`** (class attribute) is the one place
+  that maps a verb to its key. Earlier, when only move/copy existed, message text derived the
+  key letter as `verb[0]` — that stopped working the moment `x`/`"cut"` existed, since `"copy"`
+  and `"cut"` both start with `c`. Don't reintroduce a `verb[0]`-style shortcut if a fourth verb
+  is ever added; extend the table instead.
+- **The collision preflight is all-or-nothing, checked before any `shutil.move`/`shutil.copy2`/
+  `shutil.copytree` call runs.** `_op_batch()` walks the whole batch — nested-mark collapse,
+  duplicate basenames *within the batch itself* (two marked files that happen to share a name
+  once dropped into one destination), then `os.path.lexists()` against the destination — and
+  refuses the entire operation if any check fails. It is shared unchanged by all three verbs,
+  since none of this logic depends on whether the batch ends up relocated or duplicated. The
+  point is that a user who sees "would collide" never has to wonder which of N items actually
+  moved before the browser noticed; either everything is validated and then acted on, or
+  nothing is. If `do_move()`/`do_copy()` still fail partway (an `OSError` the preflight
+  couldn't foresee — permissions, a device disappearing), the message says "moved/cut/copied N
+  of M" honestly rather than implying atomicity it can no longer promise. A `copytree` that
+  fails partway is the messier case of the two: it can leave a partially-populated directory at
+  the destination, so "copied N of M" understates what actually needs cleaning up there, unlike
+  a failed `shutil.move` (nothing partial to leave behind per item) or a failed `copy2` (the one
+  file either copied or didn't).
+- **`shutil.move()`, never `os.rename()`, and always passed the destination directory, not
+  the joined path.** Passing the directory lets `shutil.move` resolve the join itself; joining
+  it yourself risks falling through to a raw rename that silently replaces whatever the
+  preflight above just checked for. `shutil.move` also degrades across filesystems, which a
+  bare rename does not.
+- **`shutil.copytree` needs the joined destination path; `shutil.copy2` needs the bare
+  directory — `do_copy()`'s `p.is_dir()` branch exists only because of this asymmetry.**
+  Unlike `shutil.move`/`shutil.copy2`, `copytree` refuses an existing target directory rather
+  than resolving the join itself (the collision preflight already guarantees the target doesn't
+  exist, so that refusal never actually fires — the asymmetry is still real and would silently
+  copy into the wrong place if the two calls were made to look the same).
+- **Copy's symlink handling intentionally diverges from move's.** `shutil.copytree`'s default
+  (`symlinks=False`) and `shutil.copy2`'s default (`follow_symlinks=True`) both dereference
+  links, so copying a folder of symlinks yields real copies of their targets — whereas
+  `shutil.move` relocates a symlink as a symlink. This is the stdlib default, left as-is rather
+  than passed `symlinks=True`/`follow_symlinks=False`; if that turns out to be the wrong call,
+  it is a deliberate flag flip here, not a bug to rediscover.
+- **A destination inside a marked folder is refused, not attempted.** Moving/copying/cutting a
+  folder into its own descendant is checked with `Path.is_relative_to` before anything happens,
+  and the refusal keeps `marked`/`pending_op` intact so the user can just pick a different
+  destination instead of re-marking everything.
+- **The confirm prompt's `self.message` bypasses `_hint_line()`'s segment-dropping truncation** —
+  that logic only applies to the default hint list, so a raw message is just sliced
+  `hint[:cols-3]`. The prompt therefore elides the destination path from the **left**
+  (`"…" + tail`), the same rule `_title_line()` uses for long paths, specifically so the
+  trailing `"y to confirm"` is never what a long path or a long name list pushes off the edge
+  of a narrow terminal — right-truncating a safety confirmation is the one truncation bug in
+  this file that would actually be dangerous.
+- **`q` and `ESC` are no longer the same branch in `run()`.** They were merged
+  (`key in ("q", "ESC")`) before move/copy/cut mode existed, since both just quit. Now `ESC`
+  is context-sensitive: with a `pending_op` set it cancels the mode (clears `marked` and
+  `pending_op`, same "`{verb} cancelled`" message `try_op()` uses for a non-`y` confirm reply)
+  and falls through to the next loop iteration instead of returning; with no `pending_op` it
+  still `return`s exactly like `q`. `q` itself keeps its own unconditional branch — it must
+  always quit, pending op or not, since it's the one key with no double meaning anywhere else
+  in the file. Don't refold these back into one `elif`; that's exactly the merge that made `ESC`
+  unable to mean anything but quit.
+
 ## Scope
 
 `start.txt` is the original user request. It explains *why* the bindings are what they are,

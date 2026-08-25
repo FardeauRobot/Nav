@@ -501,12 +501,19 @@ class Row:
 
 
 class Navigateur:
+    # "cut" and "copy" both start with c, so the key can't be read off the
+    # verb name (verb[0]) the way move/copy could -- this table is the one
+    # place that maps a verb to the key that triggers it.
+    VERB_KEYS = {"move": "m", "copy": "c", "cut": "x"}
+
     def __init__(self, root: Path, cfg: dict) -> None:
         self.root = root
         self.cfg = cfg
         self.colors = cfg["colors"]
         self.show_hidden = bool(cfg["behavior"]["show_hidden"])
         self.expanded: set[str] = set()
+        self.marked: set[str] = set()
+        self.pending_op: str | None = None  # None, "move", "copy", or "cut"
         self.cursor = 0
         self.top = 0
         self.rows: list[Row] = []
@@ -853,6 +860,165 @@ class Navigateur:
         self.message = message
         return False
 
+    def toggle_mark(self) -> None:
+        """e -- mark or unmark the highlighted row while a move, copy or cut
+        is pending. Marks are path strings, same convention as `expanded`:
+        independent of `self.rows`, so collapsing a marked folder never
+        unmarks it. Marks are shared across all three verbs -- switching
+        which verb key you press keeps whatever is already marked."""
+        if self.pending_op is None:
+            self.message = "press m to move, c to copy, x to cut"
+            return
+        row = self.current()
+        if row is None:
+            self.message = "nothing here to mark"
+            return
+        key = str(row.path)
+        if key in self.marked:
+            self.marked.discard(key)
+        else:
+            self.marked.add(key)
+        n = len(self.marked)
+        verb = self.pending_op
+        letter = self.VERB_KEYS[verb]
+        self.message = (f"{n} marked -- {letter} to {verb} here" if n
+                        else f"{verb} mode -- e to mark, {letter} to {verb} here")
+
+    def _op_batch(self, dest: Path) -> list[Path] | None:
+        """The marked set, reduced to what actually needs to move/copy/cut:
+        nested marks collapsed onto their ancestor (relocating/copying the
+        ancestor already carries the descendant with it), and items already
+        sitting in `dest` dropped. Returns None -- with self.message already
+        set -- on a refusal that must not clear the marks (a bad destination,
+        or a name collision), so the user can pick a different destination
+        without re-marking everything. Shared by all three verbs since the
+        preflight (nested-mark collapse, duplicate names, lexists collision)
+        doesn't depend on which one is relocating or duplicating the batch."""
+        verb = self.pending_op
+        marks = sorted((Path(p) for p in self.marked), key=lambda p: len(p.parts))
+        top: list[Path] = []
+        for p in marks:
+            if not any(p.is_relative_to(a) for a in top):
+                top.append(p)
+        for p in top:
+            if p.is_dir() and (dest == p or dest.is_relative_to(p)):
+                self.message = f"can't {verb} {p.name} into itself"
+                return None
+        batch = [p for p in top if p.parent != dest]
+        if not batch:
+            return []
+        names = [p.name for p in batch]
+        dup = next((n for n in names if names.count(n) > 1), None)
+        if dup is not None:
+            self.message = f"two marked items are both named '{dup}'"
+            return None
+        for p in batch:
+            if os.path.lexists(dest / p.name):
+                self.message = f"'{p.name}' already exists at the destination"
+                return None
+        return batch
+
+    def try_op(self, screen: Screen, cols: int, height: int) -> None:
+        """m/c/x, second press -- validate the batch, confirm with `y`, then
+        move, copy or cut per self.pending_op. Any reply other than `y` is a
+        full cancel, mirroring the B/b prompt's "anything else cancels" rule."""
+        verb = self.pending_op
+        dest = self.published_dir()
+        batch = self._op_batch(dest)
+        if batch is None:
+            return
+        if not batch:
+            self.marked.clear()
+            self.pending_op = None
+            self.message = f"nothing to {verb} -- already there"
+            return
+        # _hint_line's own truncation drops whole segments rather than
+        # slicing mid-string, so a raw message here must not rely on that --
+        # "y to confirm" must never be the part a long destination path or
+        # name list pushes off the end of the line. Drop the names first,
+        # then -- if the path alone still doesn't fit -- elide the path from
+        # the LEFT, the same rule _title_line() uses: the tail of a path is
+        # the informative half.
+        tail = " -- y to confirm"
+        lead = f"{verb} {len(batch)} to "
+        dest_str = home_short(dest)
+        names = ", ".join(p.name for p in batch)
+        budget = max(0, cols - 3)
+        prompt = f"{lead}{dest_str} ({names}){tail}"
+        if len(prompt) > budget:
+            prompt = f"{lead}{dest_str}{tail}"
+        if len(prompt) > budget:
+            room = budget - len(lead) - len(tail)
+            if room > 1:
+                dest_str = "…" + dest_str[-(room - 1):]
+            else:
+                dest_str = ""
+            prompt = f"{lead}{dest_str}{tail}"
+        reply = self.read_slot(screen, cols, height, prompt)
+        if reply in ("\x03", "\x04"):
+            return  # ctrl-c / ctrl-d still quit from inside the prompt
+        if reply != "y":
+            self.marked.clear()
+            self.pending_op = None
+            self.message = f"{verb} cancelled"
+            return
+        if verb == "copy":
+            self.do_copy(dest, batch)
+        else:
+            self.do_move(dest, batch, verb)
+
+    def do_move(self, dest: Path, batch: list[Path], verb: str = "move") -> None:
+        """The moves themselves -- shared by move and cut, which are the same
+        filesystem operation under two keys (per the user's explicit choice
+        of a real `x` binding over treating cut as a plain alias for `m`).
+        `verb` only steers the message text ("moved"/"cut"). dest is always
+        passed as the directory, never joined with a name: shutil.move
+        resolves that itself, and joining it ourselves risks falling through
+        to a raw os.rename that would silently replace whatever the
+        collision preflight already checked for."""
+        action = "moved" if verb == "move" else "cut"
+        moved = 0
+        for p in batch:
+            try:
+                shutil.move(str(p), str(dest))
+            except (OSError, shutil.Error) as exc:
+                self.message = f"{action} {moved} of {len(batch)} -- failed on {p.name}: {exc}"
+                break
+            moved += 1
+        else:
+            self.message = f"{action} {moved} item{'s' if moved != 1 else ''} to {home_short(dest)}"
+        self.marked.clear()
+        self.pending_op = None
+        self.open_node(dest)
+        self.rebuild()
+        self.select_path(dest)
+
+    def do_copy(self, dest: Path, batch: list[Path]) -> None:
+        """The copies themselves. Unlike shutil.move, shutil.copytree refuses
+        an existing target directory rather than merging into it -- the
+        collision preflight already guarantees dest/name doesn't exist, so
+        that refusal never fires here, but it does mean a directory needs the
+        name joined explicitly rather than handed the bare dest the way
+        shutil.copy2 (file case) accepts."""
+        copied = 0
+        for p in batch:
+            try:
+                if p.is_dir():
+                    shutil.copytree(str(p), str(dest / p.name))
+                else:
+                    shutil.copy2(str(p), str(dest))
+            except (OSError, shutil.Error) as exc:
+                self.message = f"copied {copied} of {len(batch)} -- failed on {p.name}: {exc}"
+                break
+            copied += 1
+        else:
+            self.message = f"copied {copied} item{'s' if copied != 1 else ''} to {home_short(dest)}"
+        self.marked.clear()
+        self.pending_op = None
+        self.open_node(dest)
+        self.rebuild()
+        self.select_path(dest)
+
     # -- render -----------------------------------------------------------
 
     def frame(self, cols: int, height: int) -> list[str]:
@@ -918,10 +1084,16 @@ class Navigateur:
         segments rather than slicing a word in half."""
         if self.message:
             hint = self.message
+        elif self.pending_op:
+            verb = self.pending_op
+            letter = self.VERB_KEYS[verb]
+            n = len(self.marked)
+            hint = (f"{verb} mode: {n} marked -- e to mark, {letter} to {verb} here" if n
+                    else f"{verb} mode -- e to mark, {letter} to {verb} here")
         else:
             segs = ["hjkl move", "o open", "O reveal", "F lead", "f follow",
-                    "B mark", "b go", ". hidden", "↵ cd here", "w window",
-                    "t tab", "q quit"]
+                    "B mark", "b go", "m move", "c copy", "x cut", "e mark",
+                    ". hidden", "↵ cd here", "w window", "t tab", "q quit"]
             hint = " · ".join(segs)
             while segs and len(hint) > cols - 3:
                 segs.pop(-2 if len(segs) > 1 else 0)
@@ -934,13 +1106,16 @@ class Navigateur:
         caret = f"{fg(c['accent'])}❯{RESET}" if selected else " "
         # clamp the indent so very deep nesting can't drive text_w negative
         pad = "  " * min(row.depth, max(0, (inner - 12) // 2))
+        marked = str(row.path) in self.marked
+        mark_plain = "✓ " if marked else ""
+        mark_styled = f"{fg(c['accent'])}✓{RESET} " if marked else ""
         if row.is_dir:
             tri = "▾" if self.is_open(row.path) else "▸"
-            name = f"{fg(c['dim'])}{tri} {fg(c['dir'])}{row.path.name}/{RESET}"
-            plain = f"{tri} {row.path.name}/"
+            name = f"{mark_styled}{fg(c['dim'])}{tri} {fg(c['dir'])}{row.path.name}/{RESET}"
+            plain = f"{mark_plain}{tri} {row.path.name}/"
         else:
-            name = f"  {fg(c['file'])}{row.path.name}{RESET}"
-            plain = f"  {row.path.name}"
+            name = f"{mark_styled}  {fg(c['file'])}{row.path.name}{RESET}"
+            plain = f"{mark_plain}  {row.path.name}"
 
         text_w = inner - 3 - len(pad)
         if len(plain) > text_w > 0:
@@ -975,8 +1150,20 @@ class Navigateur:
             had_message = bool(self.message)
             self.message = ""
 
-            if key in ("q", "ESC"):
+            if key == "q":
                 return
+            elif key == "ESC":
+                # Esc backs out of move/copy/cut mode without touching the
+                # marked files -- same as pressing the verb key with nothing
+                # marked, just reachable without emptying the marks first.
+                # Outside a pending op it's still an alias for q.
+                if self.pending_op:
+                    verb = self.pending_op
+                    self.marked.clear()
+                    self.pending_op = None
+                    self.message = f"{verb} cancelled"
+                else:
+                    return
             elif key == "ENTER":
                 self.chosen = self.published_dir()
                 return
@@ -1054,6 +1241,22 @@ class Navigateur:
                     else:
                         self.reveal_path(target)
                         self.message = f"went to bookmark {slot}"
+            elif key in ("m", "c", "x"):
+                verb = {"m": "move", "c": "copy", "x": "cut"}[key]
+                if self.pending_op != verb:
+                    # Entering fresh, or switching verb mid-mark -- either way
+                    # the current marks (if any) carry over unchanged.
+                    self.pending_op = verb
+                    n = len(self.marked)
+                    self.message = (f"{n} marked -- {key} to {verb} here" if n
+                                     else f"{verb} mode -- e to mark, {key} to {verb} here")
+                elif not self.marked:
+                    self.pending_op = None
+                    self.message = f"{verb} cancelled -- nothing marked"
+                else:
+                    self.try_op(screen, cols, height)
+            elif key == "e":
+                self.toggle_mark()
             elif key == ".":
                 self.show_hidden = not self.show_hidden
                 self.rebuild()
