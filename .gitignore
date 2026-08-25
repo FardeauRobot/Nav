@@ -1,1 +1,3 @@
 start.txt
+__pycache__/
+*.pyc
