@@ -217,6 +217,38 @@ and the move/copy/cut messages read `self.keys["mark"]` rather than spelling `e`
   truncation rule (it drops the *second-to-last* segment first), so `? keys` sits near the
   front: the surviving segments at 40 cols are the front of the list plus `q quit`.
 
+### Writing config.toml
+
+The settings panel is the **first code that writes user configuration**, and
+`write_config_value()` exists in the shape it does because of one rule: **patch the single
+line, never regenerate the file.** `DEFAULT_CONFIG_TEXT` is written only on first run, so
+by the time anything edits the file it holds the user's comments, their column alignment,
+and possibly keys this version has never heard of. Rebuilding it from the template to
+change one colour would silently delete all three. There is no stdlib TOML writer and that
+is not a reason to hand-roll a serialiser.
+
+- **`_trailing_comment()` skips the quoted value before it looks for `#`.** Every colour in
+  this file *is* a `"#rrggbb"` string, so a bare `rest.index("#")` cuts one in half and
+  turns the value into a comment.
+- **`_save_config()` writes a temp file and `os.replace`s it.** A config truncated by a
+  crash mid-write takes the colours with it, and the browser reads this file before it can
+  draw the screen you would fix it from.
+- **`key_ok()` is the one validator**, shared by `load_config()` and the panel — the same
+  class of rule as `group_ok()`. A collision is *refused*, never resolved: two actions on
+  one key would otherwise be settled silently by the order of `run()`'s elif chain. In
+  `load_config()` a bad binding degrades to its default key by key, matching how every
+  other setting there behaves.
+- **`DEFAULTS["keys"]` and the `[keys]` half of `DEFAULT_CONFIG_TEXT` are generated from
+  `KEY_SECTIONS`**, not written out by hand. CLAUDE.md's rule is that `DEFAULTS`,
+  `DEFAULT_CONFIG_TEXT` and the README table change together; generating two of the three
+  is how that stops depending on anyone remembering.
+- **A rebind rebuilds `self.binds` rather than patching it**, so the old key stops working
+  in the same keystroke. Colours are applied by mutating `self.colors`, which is the dict
+  every `fg()`/`bg()` call already reads — nothing to relaunch, and the panel is honest
+  about the difference if the *write* fails but the in-memory change stuck.
+- **An armed edit row swallows the keypress before any panel navigation**, which is the
+  only reason `q` can be bound to something. `^c`/`^d` are checked above even that.
+
 ## Cross-file invariants
 
 Each of these looks like removable noise and is load-bearing:

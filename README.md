@@ -168,8 +168,8 @@ bindings rather than the defaults. `,` opens a small menu:
 
 | panel | shows |
 |---|---|
-| colours | every colour in `config.toml`, its hex, and a swatch in that colour |
-| keybinds | every rebindable action and the key it's on |
+| colours | every colour in `config.toml`, its hex, and a swatch in that colour — `↵` to type a new one |
+| keybinds | every rebindable action and the key it's on — `↵`, then press a key |
 | bookmarks | all ten slots, where each points, and which ones are dead |
 
 Inside a panel: `j`/`k` move, `↵` opens the row (in **bookmarks**, `↵` goes
@@ -347,11 +347,16 @@ inherited.
 
 ---
 
-## Colours
+## Colours and keys
 
-`~/.navigateur/config.toml`, written on first run:
+`~/.navigateur/config.toml`, written on first run — or edited for you by the
+`,` panel, which patches the one line it changes and leaves your comments and
+spacing alone:
 
 ```toml
+# navigateur configuration. Colours are plain hex. Edit this file, or press `,`
+# in the browser -- it patches the one line it changes and leaves the rest be.
+
 [colors]
 accent      = "#d97757"   # the ❯ caret and the active root
 dir         = "#7aa2f7"
@@ -363,12 +368,33 @@ selected_bg = "#292e42"
 [behavior]
 show_hidden    = false
 follow_default = false   # start this window as the leader
+
+[keys]
+down           = "j"     # ... one line per action, see `?`
+up             = "k"
 ```
 
 Plain 24-bit hex, no palette slots. A bad value falls back key by key rather
 than failing — a typo shouldn't cost you the browser you'd use to fix it. The
 two `[behavior]` keys are type-checked as booleans, so they need a literal
 `true` or `false`; `show_hidden = 1` is ignored.
+
+### Rebinding
+
+`,` → **keybinds**, `↵` on a row, then press the key you want. Or edit
+`[keys]` by hand. Either way the same rules apply, and a binding that breaks
+one falls back to its default rather than taking the section down with it:
+
+- One printable character. Not `q`, `Esc`, `↵`, `Ctrl-C` or `Ctrl-D` — the
+  ways *out* of the browser are deliberately not yours to misspell — and not a
+  digit, because `B` and `b` read one of those as a bookmark slot.
+- No two actions on the same key. A collision is refused outright rather than
+  quietly settled by whichever branch happens to be checked first.
+- The arrow keys always work, whatever `down`/`up`/`enter`/`leave` are bound
+  to. Rebinding `j` cannot cost you `↓`.
+
+Colours are editable the same way (`,` → **colours**, `↵`, type `#rrggbb`) and
+apply immediately — no relaunch.
 
 `follow_default = true` is the **leader** side despite its name: it opens every
 browser session as if you had pressed `F`, taking the lead of `default`. It

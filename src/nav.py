@@ -93,7 +93,8 @@ def write_bookmark(slot: str, path: Path) -> bool:
 MAX_DEPTH = 40
 
 DEFAULT_CONFIG_TEXT = '''\
-# navigateur configuration. Colours are plain hex; edit and relaunch.
+# navigateur configuration. Colours are plain hex. Edit this file, or press `,`
+# in the browser -- it patches the one line it changes and leaves the rest be.
 
 [colors]
 accent      = "#d97757"   # the caret, the active root
@@ -203,6 +204,28 @@ ARROW_KEYS = {"DOWN": "down", "UP": "up", "RIGHT": "enter", "LEFT": "leave"}
 # digits are excluded because B and b read one as a bookmark slot.
 RESERVED_KEYS = frozenset({"q", "ESC", "ENTER", "\x03", "\x04"} | set("0123456789"))
 
+# The keymap joins the config, so DEFAULTS and DEFAULT_CONFIG_TEXT grow a
+# [keys] section -- generated from the table above rather than written out by
+# hand, which is the only way the template can't drift from it.
+DEFAULTS["keys"] = dict(DEFAULT_KEYS)
+DEFAULT_CONFIG_TEXT += "\n[keys]\n# One key per action. Press `,` in the browser to change these.\n"
+DEFAULT_CONFIG_TEXT += "".join(
+    f'{action:<15}= "{key}"\n' for action, key in DEFAULT_KEYS.items())
+
+
+def key_ok(key: str, action: str, keys: dict[str, str]) -> str:
+    """Why `key` cannot be bound to `action`, or "" if it can. One function so
+    the config loader and the settings panel refuse exactly the same set --
+    the same class of rule as group_ok()."""
+    if len(key) != 1 or not key.isprintable():
+        return "needs to be one printable character"
+    if key in RESERVED_KEYS:
+        return f"{key} is reserved"
+    for other, bound in keys.items():
+        if bound == key and other != action:
+            return f"{key} is already {ACTION_DESC[other]}"
+    return ""
+
 
 # --------------------------------------------------------------------------- config
 
@@ -230,7 +253,97 @@ def load_config() -> dict:
             for key in values:
                 if key in got and isinstance(got[key], type(values[key])):
                     values[key] = got[key]
+    # [keys] needs more than a type check: a binding can be reserved, or can
+    # collide with another action, and either one would be resolved silently by
+    # dispatch order. Same degrade-key-by-key rule -- the bad entry falls back
+    # to its default, the rest of the file still applies.
+    for action in DEFAULT_KEYS:
+        if key_ok(cfg["keys"][action], action, cfg["keys"]):
+            cfg["keys"][action] = DEFAULT_KEYS[action]
     return cfg
+
+
+def toml_quote(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def write_config_value(section: str, key: str, value: str) -> bool:
+    """Patch one key in config.toml and leave every other byte alone.
+
+    tomllib is read-only and there is no stdlib writer, but the fix is NOT to
+    regenerate the file from DEFAULT_CONFIG_TEXT: that template is written only
+    on first run, so by now the file holds the user's comments, their spacing,
+    and possibly keys this version has never heard of. All of that has to
+    survive being able to change one colour from the settings panel."""
+    try:
+        text = CONFIG.read_text() if CONFIG.exists() else DEFAULT_CONFIG_TEXT
+    except OSError:
+        return False
+    lines = text.splitlines()
+    quoted = toml_quote(value)
+
+    here = ""          # the section we are inside right now
+    end_of_section = None  # last line index still belonging to `section`
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            here = stripped[1:-1].strip()
+            continue
+        if here != section:
+            continue
+        end_of_section = i
+        name, sep, rest = line.partition("=")
+        if not sep or name.strip() != key:
+            continue
+        # Keep the indentation, the name column and any trailing comment;
+        # replace the value and nothing else. The comment has to be found
+        # *after* the value, not with a bare rest.index("#") -- every colour in
+        # this file is a "#rrggbb" string and that would cut one in half.
+        comment = _trailing_comment(rest)
+        pad = "   " if comment else ""
+        lines[i] = f"{name}= {quoted}{pad}{comment}".rstrip()
+        return _save_config(lines)
+
+    new = f"{key} = {quoted}"
+    if end_of_section is None:
+        lines += ["", f"[{section}]", new]
+    else:
+        lines.insert(end_of_section + 1, new)
+    return _save_config(lines)
+
+
+def _trailing_comment(rest: str) -> str:
+    """The `# ...` after a TOML value, skipping over a quoted string so that a
+    "#d97757" colour is never mistaken for the start of a comment."""
+    after = rest.lstrip()
+    if after.startswith('"'):
+        i = 1
+        while i < len(after):
+            if after[i] == "\\":
+                i += 2
+                continue
+            if after[i] == '"':
+                i += 1
+                break
+            i += 1
+        after = after[i:]
+    return after[after.index("#"):] if "#" in after else ""
+
+
+def _save_config(lines: list[str]) -> bool:
+    """Write via a temp file in the same directory, then rename: a config
+    truncated by a crash mid-write would take the colours with it."""
+    tmp = CONFIG.with_suffix(".toml.tmp")
+    try:
+        tmp.write_text("\n".join(lines) + "\n")
+        os.replace(tmp, CONFIG)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return False
+    return True
 
 
 def fg(hexcolor: str, fallback: str = "#c0caf5") -> str:
@@ -621,7 +734,7 @@ class Navigateur:
         # action -> key, and its reverse index. run() dispatches on the action,
         # never on a literal character, which is what stops the `?` table from
         # describing a binding the dispatch no longer honours.
-        self.keys = dict(DEFAULT_KEYS)
+        self.keys = dict(cfg.get("keys") or DEFAULT_KEYS)
         self.binds = self._build_binds()
         # A panel is a *mode*, not an overlay: Screen.paint() diffs against the
         # previous frame, so anything drawn outside frame()'s return value is
@@ -630,6 +743,10 @@ class Navigateur:
         self.mode: str | None = None
         self.panel_top = 0
         self.panel_cursor = 0
+        # None, "bind" (the next keypress becomes a binding) or "color" (typing
+        # a hex value into edit_buf). Both live only while a panel is up.
+        self.panel_edit: str | None = None
+        self.edit_buf = ""
         self.rebuild()
 
     def _build_binds(self) -> dict[str, str]:
@@ -1248,11 +1365,15 @@ class Navigateur:
         """The current panel's body and its default footer. Both the renderer
         and _panel_key() go through here, so the cursor can never run past the
         end of a body that only the renderer knew the length of."""
+        if self.panel_edit == "bind":
+            return self._binds_body(), "press any key · esc cancels"
+        if self.panel_edit == "color":
+            return self._colors_body(), "type #rrggbb · ↵ save · esc cancels"
         return {
             "keys": lambda: (self._keys_body(), "esc back · j/k scroll"),
             "settings": lambda: (self._settings_body(), "↵ open · esc back"),
-            "colors": lambda: (self._colors_body(), "esc back · edit config.toml"),
-            "binds": lambda: (self._binds_body(), "esc back"),
+            "colors": lambda: (self._colors_body(), "↵ edit · esc back"),
+            "binds": lambda: (self._binds_body(), "↵ rebind · esc back"),
             "bookmarks": lambda: (self._bookmarks_body(), "↵ go there · esc back"),
         }[self.mode]()
 
@@ -1352,8 +1473,15 @@ class Navigateur:
         c = self.colors
         accent, dim = fg(c["accent"]), fg(c["dim"])
         out = []
-        for name in DEFAULTS["colors"]:
+        for i, name in enumerate(DEFAULTS["colors"]):
             value = str(c.get(name, DEFAULTS["colors"][name]))
+            if self.panel_edit == "color" and i == self.panel_cursor:
+                shown = (self.edit_buf + "_").ljust(10)
+                # No swatch while typing: a half-typed hex would render as the
+                # fallback colour and look like it had already been applied.
+                out.append((f"  {name.ljust(12)}{shown}",
+                            f"  {accent}{name.ljust(12)}{RESET}{accent}{shown}{RESET}"))
+                continue
             # The swatch is the whole point: hex in a config file is unreadable
             # until you see it next to the colour it actually produces.
             out.append((f"  {name.ljust(12)}{value.ljust(10)}████",
@@ -1365,11 +1493,51 @@ class Navigateur:
         c = self.colors
         accent, plainc = fg(c["accent"]), fg(c["file"])
         out = []
-        for action, key in self.keys.items():
+        for i, (action, key) in enumerate(self.keys.items()):
             desc = ACTION_DESC[action]
+            if self.panel_edit == "bind" and i == self.panel_cursor:
+                out.append((f"  _    press a key for “{desc}”",
+                            f"  {accent}_    press a key for “{desc}”{RESET}"))
+                continue
             out.append((f"  {key.ljust(4)}{desc}",
                         f"  {accent}{key.ljust(4)}{RESET}{plainc}{desc}{RESET}"))
         return out
+
+    def _rebind(self, key: str) -> None:
+        """The keypress that lands on an armed keybinds row."""
+        self.panel_edit = None
+        action = list(self.keys)[self.panel_cursor]
+        if key == "ESC":
+            self.message = "unchanged"
+            return
+        why = key_ok(key, action, self.keys)
+        if why:
+            # Refused, not resolved: two actions on one key would be settled
+            # silently by the order of run()'s elif chain.
+            self.message = why
+            return
+        self.keys[action] = key
+        self.binds = self._build_binds()  # rebuild, don't patch: the old key
+        if write_config_value("keys", action, key):  # must stop working at once
+            self.message = f"{ACTION_DESC[action]} is now {key}"
+        else:
+            self.message = f"{key} works now, but config.toml could not be written"
+
+    def _recolor(self) -> None:
+        """↵ on a colour being typed. Applied live -- self.colors is the dict
+        every fg()/bg() call reads, so there is nothing to relaunch."""
+        value = self.edit_buf
+        name = list(DEFAULTS["colors"])[self.panel_cursor]
+        self.panel_edit, self.edit_buf = None, ""
+        if len(value) != 7 or not value.startswith("#") or \
+                any(ch not in "0123456789abcdefABCDEF" for ch in value[1:]):
+            self.message = f"{value} is not a #rrggbb colour"
+            return
+        self.colors[name] = value
+        if write_config_value("colors", name, value):
+            self.message = f"{name} is now {value}"
+        else:
+            self.message = f"{name} is {value} for now -- config.toml is unwritable"
 
     def _bookmarks_body(self) -> list[tuple[str, str]]:
         c = self.colors
@@ -1410,8 +1578,11 @@ class Navigateur:
                 self.mode = None
                 self.message = f"went to bookmark {slot}"
                 self.maybe_publish()
-        else:
-            self.message = "not editable yet -- edit config.toml and relaunch"
+        elif self.mode == "binds":
+            self.panel_edit = "bind"
+        elif self.mode == "colors":
+            self.panel_edit = "color"
+            self.edit_buf = "#"
 
     def _panel_key(self, key: str) -> bool:
         """One keypress while a panel is up. Returns True only for the keys
@@ -1421,7 +1592,28 @@ class Navigateur:
         is the documented invariant kept deliberately rather than adopting the
         pager convention: `q` is the one key in this file with no second
         meaning anywhere, and ESC already carries the context-sensitive one."""
-        if key in ("q", "\x03", "\x04"):
+        if key in ("\x03", "\x04"):
+            return True
+
+        # An armed row swallows the keypress first -- otherwise `q` could never
+        # be bound to anything, and typing a hex value would trip the panel's
+        # own navigation. ctrl-c/ctrl-d above still quit, as they do everywhere.
+        if self.panel_edit == "bind":
+            self._rebind(key)
+            return False
+        if self.panel_edit == "color":
+            if key == "ESC":
+                self.panel_edit, self.edit_buf = None, ""
+                self.message = "unchanged"
+            elif key == "ENTER":
+                self._recolor()
+            elif key == "\x7f":  # backspace, never past the leading '#'
+                self.edit_buf = self.edit_buf[:1] or "#"
+            elif len(key) == 1 and key.isprintable() and len(self.edit_buf) < 7:
+                self.edit_buf += key
+            return False
+
+        if key == "q":
             return True
         if key == "ESC":
             # One level at a time: a submenu falls back to the settings menu,
