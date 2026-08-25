@@ -206,7 +206,7 @@ collapse → jump-to-parent → re-root; `O`/reveal is not in the request at all
 the implementation back toward `start.txt`.
 
 README's "Not in this first pass" lists deliberate omissions (fuzzy search, file operations,
-bookmarks, git decorations, a bash integration, following across machines).
+git decorations, a bash integration, following across machines).
 
 **zsh is a hard requirement, not a preference** — bash has no `zle -F`, so a bash port would
 silently lose live follow rather than fail loudly. On Fedora that means `dnf install zsh`.

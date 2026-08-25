@@ -73,6 +73,8 @@ the function cds there afterwards — the same trick `ranger` and `lf` use.
 | `t` | open this folder in a **new terminal tab** |
 | `F` | make this window the **leader** of its group — its followers go where it goes |
 | `f` | make this window a **follower** in its group — refused if nobody is leading it |
+| `B` then `0`-`9` | bookmark the highlighted folder under that digit |
+| `b` then `0`-`9` | go to that bookmark |
 | `.` | show/hide dotfiles |
 | `g` / `G` | top / bottom |
 | `↵` | quit **and** cd your shell here |
@@ -292,17 +294,22 @@ than failing — a typo shouldn't cost you the browser you'd use to fix it.
 | `install.sh` | writes the `source` line into your `.zshrc`; `--uninstall` removes it |
 | `src/nav.py` | the TUI — raw ANSI, never writes data to stdout |
 | `src/nav.zsh` | the `nav()` function (`navigate`/`n` alias it), follow subscription, hooks |
-| `~/.navigateur/` | `config.toml`, `roles/<tty>`, `groups/<group>/{cwd,sub/<tty>.fifo}` |
+| `~/.navigateur/` | `config.toml`, `roles/<tty>`, `groups/<group>/{cwd,sub/<tty>.fifo}`, `bookmarks/<digit>` |
 
 Upgrading from a version without groups: your role files still read correctly
 (they are taken as group `default`), but the broadcast files moved under
 `groups/`, so a window that was already following needs one `navigate follow` to
 re-subscribe. Deleting `~/.navigateur` returns everything to first-run state.
 
+Bookmarks are ten shared slots, `0`-`9`, one file each under
+`~/.navigateur/bookmarks/`, holding a single path. They aren't per-terminal
+like roles — set one in any window with `B`, and every window (and future
+session) can jump to it with `b`.
+
 Hooks install via `add-zsh-hook`, never by assigning `precmd_functions` — Warp
 already has entries there and clobbering the array breaks the terminal.
 
 ## Not in this first pass
 
-Fuzzy search, file operations (rename/delete/move), bookmarks, git-status
-decorations, a bash integration, and following across machines.
+Fuzzy search, file operations (rename/delete/move), git-status decorations, a
+bash integration, and following across machines.

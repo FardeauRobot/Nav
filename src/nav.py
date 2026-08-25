@@ -66,6 +66,30 @@ def gen_file(group: str) -> Path:
     return GROUPS / group / "gen"
 
 
+BOOKMARKS = STATE / "bookmarks"
+
+
+def bookmark_file(slot: str) -> Path:
+    return BOOKMARKS / slot
+
+
+def read_bookmark(slot: str) -> Path | None:
+    try:
+        text = bookmark_file(slot).read_text().strip()
+    except OSError:
+        return None
+    return Path(text) if text else None
+
+
+def write_bookmark(slot: str, path: Path) -> bool:
+    try:
+        BOOKMARKS.mkdir(parents=True, exist_ok=True)
+        bookmark_file(slot).write_text(str(path) + "\n")
+    except OSError:
+        return False
+    return True
+
+
 MAX_DEPTH = 40
 
 DEFAULT_CONFIG_TEXT = '''\
@@ -621,6 +645,17 @@ class Navigateur:
         self.rebuild()
         self.select_path(target)
 
+    def read_slot(self, screen: Screen, cols: int, height: int,
+                  prompt: str) -> str | None:
+        """Block for one more keypress after B/b, showing `prompt` in the hint
+        line first. Returns the raw key -- the caller sorts digit from cancel
+        from quit, because ctrl-c/ctrl-d must keep exiting the browser from
+        inside this prompt exactly as they do at the top level; folding that
+        into "anything non-digit cancels" would swallow them instead."""
+        self.message = prompt
+        screen.paint(self.frame(cols, height))
+        return screen.key(None)
+
     # -- actions ----------------------------------------------------------
 
     def move(self, delta: int) -> None:
@@ -885,7 +920,8 @@ class Navigateur:
             hint = self.message
         else:
             segs = ["hjkl move", "o open", "O reveal", "F lead", "f follow",
-                    ". hidden", "↵ cd here", "w window", "t tab", "q quit"]
+                    "B mark", "b go", ". hidden", "↵ cd here", "w window",
+                    "t tab", "q quit"]
             hint = " · ".join(segs)
             while segs and len(hint) > cols - 3:
                 segs.pop(-2 if len(segs) > 1 else 0)
@@ -989,6 +1025,35 @@ class Navigateur:
                 elif self.set_role("follower"):
                     self.message = "following the leader of group " + self.group
                     self.sync_from_leader(force=True)  # `f` means "sync me now"
+            elif key == "B":
+                slot = self.read_slot(screen, cols, height,
+                                       "bookmark: press a digit 0-9")
+                if slot in ("\x03", "\x04"):
+                    return  # ctrl-c / ctrl-d still quit from inside the prompt
+                elif slot is None or slot not in "0123456789":
+                    self.message = "bookmark cancelled"
+                elif write_bookmark(slot, self.published_dir()):
+                    self.message = (f"bookmarked {slot} → "
+                                     f"{home_short(self.published_dir())}")
+                else:
+                    self.message = "could not write the bookmark"
+            elif key == "b":
+                slot = self.read_slot(screen, cols, height,
+                                       "go to bookmark: press a digit 0-9")
+                if slot in ("\x03", "\x04"):
+                    return  # ctrl-c / ctrl-d still quit from inside the prompt
+                elif slot is None or slot not in "0123456789":
+                    self.message = "bookmark cancelled"
+                else:
+                    target = read_bookmark(slot)
+                    if target is None:
+                        self.message = f"no bookmark {slot}"
+                    elif not target.is_dir():
+                        self.message = (f"bookmark {slot} no longer exists: "
+                                         f"{target}")
+                    else:
+                        self.reveal_path(target)
+                        self.message = f"went to bookmark {slot}"
             elif key == ".":
                 self.show_hidden = not self.show_hidden
                 self.rebuild()
