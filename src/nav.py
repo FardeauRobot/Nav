@@ -121,6 +121,89 @@ DEFAULTS = {
 }
 
 
+# ------------------------------------------------------------------------- keymap
+
+# THE key table. It is the single source of truth for two things at once: what
+# the `?` panel prints, and what run() actually dispatches on. An action with no
+# row here is unreachable; a row whose action run() never tests is a lie printed
+# on screen. Keep them in step -- _selftest() below asserts it.
+#
+# A row is (action | None, key, alias, description). `action` is None for the
+# *fixed* keys: ENTER, ESC, q and the ctrl pair are shown in the table but can
+# never be rebound. That is the same reasoning as load_config()'s key-by-key
+# fallback -- a binding typo must never cost you the browser you would use to
+# fix it -- so the way out is never something the user can spell wrong.
+# `alias` is the arrow equivalent, so the table can print "j ↓" without needing
+# a second table to look arrows up in.
+KEY_SECTIONS: list[tuple[str, list[tuple[str | None, str, str, str]]]] = [
+    ("moving", [
+        ("down", "j", "↓", "down a row"),
+        ("up", "k", "↑", "up a row"),
+        ("enter", "l", "→", "expand a folder"),
+        ("leave", "h", "←", "collapse, or go up"),
+        ("top", "g", "", "first row"),
+        ("bottom", "G", "", "last row"),
+        (None, "↵", "", "cd here and quit"),
+    ]),
+    ("opening", [
+        ("open", "o", "", "open in the default app"),
+        ("reveal", "O", "", "reveal in the file manager"),
+        ("window", "w", "", "new terminal window here"),
+        ("tab", "t", "", "new terminal tab here"),
+        ("hidden", ".", "", "show or hide dotfiles"),
+    ]),
+    ("files", [
+        ("mark", "e", "", "mark or unmark a row"),
+        ("op_move", "m", "", "move marked items here"),
+        ("op_copy", "c", "", "copy marked items here"),
+        ("op_cut", "x", "", "cut marked items here"),
+    ]),
+    ("bookmarks", [
+        ("bookmark_set", "B", "", "bookmark here, then a digit"),
+        ("bookmark_go", "b", "", "jump to a bookmark digit"),
+    ]),
+    ("following", [
+        ("lead", "F", "", "lead this group, or stop"),
+        ("follow", "f", "", "follow this group, or stop"),
+    ]),
+    ("panels", [
+        ("panel_keys", "?", "", "this table"),
+        ("panel_settings", ",", "", "colours, keys, bookmarks"),
+    ]),
+    ("leaving", [
+        (None, "esc", "", "back out of a mode or a panel"),
+        (None, "q", "", "quit -- always, from anywhere"),
+        (None, "^c", "^d", "quit"),
+    ]),
+]
+
+# Every remappable action, in table order. Rows with action None are the fixed
+# keys and deliberately never reach this dict.
+DEFAULT_KEYS = {
+    action: key
+    for _section, rows in KEY_SECTIONS
+    for action, key, _alias, _desc in rows
+    if action is not None
+}
+
+# action -> its one-line description, so the settings panel can name an action
+# without a second copy of the wording.
+ACTION_DESC = {
+    action: desc
+    for _section, rows in KEY_SECTIONS
+    for action, _key, _alias, desc in rows
+    if action is not None
+}
+
+# Arrows are bound to the same actions as hjkl and are not part of the keymap:
+# rebinding "down" to `n` must not cost you the down arrow.
+ARROW_KEYS = {"DOWN": "down", "UP": "up", "RIGHT": "enter", "LEFT": "leave"}
+
+# Keys no binding may claim. ENTER/ESC/q/^c/^d are the fixed rows above; the
+# digits are excluded because B and b read one as a bookmark slot.
+RESERVED_KEYS = frozenset({"q", "ESC", "ENTER", "\x03", "\x04"} | set("0123456789"))
+
+
 # --------------------------------------------------------------------------- config
 
 
@@ -502,9 +585,14 @@ class Row:
 
 class Navigateur:
     # "cut" and "copy" both start with c, so the key can't be read off the
-    # verb name (verb[0]) the way move/copy could -- this table is the one
-    # place that maps a verb to the key that triggers it.
-    VERB_KEYS = {"move": "m", "copy": "c", "cut": "x"}
+    # verb name (verb[0]) the way move/copy could -- this is still the one
+    # place that maps a verb to the key that triggers it, but it is now
+    # *derived* from the live keymap rather than hardcoded. Spell it out as a
+    # literal again and rebinding `m` makes the hint line advertise a key that
+    # no longer does anything.
+    @property
+    def VERB_KEYS(self) -> dict[str, str]:
+        return {verb: self.keys["op_" + verb] for verb in ("move", "copy", "cut")}
 
     def __init__(self, root: Path, cfg: dict) -> None:
         self.root = root
@@ -529,7 +617,27 @@ class Navigateur:
             self.role, self.group = "leader", DEFAULT_GROUP
         self.chosen: Path | None = None
         self.message = ""
+        self.count_buf = ""  # digits typed so far for a pending "5j"-style count
+        # action -> key, and its reverse index. run() dispatches on the action,
+        # never on a literal character, which is what stops the `?` table from
+        # describing a binding the dispatch no longer honours.
+        self.keys = dict(DEFAULT_KEYS)
+        self.binds = self._build_binds()
+        # A panel is a *mode*, not an overlay: Screen.paint() diffs against the
+        # previous frame, so anything drawn outside frame()'s return value is
+        # clobbered on the next changed line. frame() and run() both dispatch
+        # on self.mode, keeping one paint path and one input path.
+        self.mode: str | None = None
+        self.panel_top = 0
+        self.panel_cursor = 0
         self.rebuild()
+
+    def _build_binds(self) -> dict[str, str]:
+        """key -> action. Arrows come last and unconditionally: they are not
+        remappable, so they cannot be stolen by a user binding."""
+        binds = {key: action for action, key in self.keys.items()}
+        binds.update(ARROW_KEYS)
+        return binds
 
     # -- model ------------------------------------------------------------
 
@@ -1022,6 +1130,8 @@ class Navigateur:
     # -- render -----------------------------------------------------------
 
     def frame(self, cols: int, height: int) -> list[str]:
+        if self.mode:
+            return self.panel_frame(cols, height)
         border = fg(self.colors["border"])
         width = max(30, min(cols, 200))
         inner = width - 2
@@ -1075,7 +1185,9 @@ class Navigateur:
         if len(raw) > room:
             raw = "…" + raw[-(room - 1):] if room > 1 else ""
         title = " " + raw + " "
-        fill = max(0, inner - 1 - len(title) - len(flag) - 1)
+        # inner + 2 printable columns, matching the body rows and the bottom
+        # border. `room` above already caps len(title), so this cannot widen.
+        fill = max(0, inner - 1 - len(title) - len(flag))
         return (f"{border}╭─{accent}{BOLD}{title}{RESET}"
                 f"{flag_fg}{flag}{border}{'─' * fill}╮{RESET}")
 
@@ -1088,17 +1200,264 @@ class Navigateur:
             verb = self.pending_op
             letter = self.VERB_KEYS[verb]
             n = len(self.marked)
-            hint = (f"{verb} mode: {n} marked -- e to mark, {letter} to {verb} here" if n
-                    else f"{verb} mode -- e to mark, {letter} to {verb} here")
+            mark = self.keys["mark"]
+            hint = (f"{verb} mode: {n} marked -- {mark} to mark, {letter} to {verb} here"
+                    if n else f"{verb} mode -- {mark} to mark, {letter} to {verb} here")
         else:
-            segs = ["hjkl move", "o open", "O reveal", "F lead", "f follow",
-                    "B mark", "b go", "m move", "c copy", "x cut", "e mark",
-                    ". hidden", "↵ cd here", "w window", "t tab", "q quit"]
+            # Deliberately short. The full list used to live here and was
+            # truncated segment by segment, so on a narrow terminal most of the
+            # keys silently vanished; the complete table is one keypress away
+            # behind `?` instead, which is also why the footer stays ONE line
+            # and frame()'s `body_h = height - 4` needs no adjusting.
+            # Order matters: the loop below drops the second-to-last segment
+            # first, so what survives a narrow terminal is the front of this
+            # list plus `q quit`. `? keys` sits near the front deliberately --
+            # it is the one segment that can replace all the others.
+            keys = self.keys
+            segs = [f"{keys['leave']}{keys['down']}{keys['up']}{keys['enter']} move",
+                    f"{keys['panel_keys']} keys",
+                    "↵ cd here",
+                    f"{keys['panel_settings']} settings",
+                    "q quit"]
             hint = " · ".join(segs)
             while segs and len(hint) > cols - 3:
                 segs.pop(-2 if len(segs) > 1 else 0)
                 hint = " · ".join(segs)
         return f"  {fg(self.colors['dim'])}{hint[:max(0, cols - 3)]}{RESET}"
+
+    # -- panels -----------------------------------------------------------
+    #
+    # A panel is a whole frame, never an overlay -- see self.mode. Every body
+    # builder below is a pure function returning (plain, styled) pairs: the
+    # plain half is what truncation and gap-padding measure, the same trick
+    # render_row() uses, and being pure is what lets them be exercised without
+    # a terminal (nav.py refuses to run unless both fds are TTYs).
+    #
+    # The panels that carry a cursor keep their bodies FLAT -- no headings, no
+    # blank rows -- so that panel_cursor is a plain index into the body list.
+    # `keys` is the one grouped panel and the one with no cursor.
+
+    PANEL_TITLES = {"keys": "keys", "settings": "settings", "colors": "colours",
+                    "binds": "keybinds", "bookmarks": "bookmarks"}
+    SETTINGS_ROWS = [("colors", "colours"), ("binds", "keybinds"),
+                     ("bookmarks", "bookmarks")]
+    CURSOR_PANELS = frozenset({"settings", "colors", "binds", "bookmarks"})
+    SUBMENUS = frozenset({"colors", "binds", "bookmarks"})
+
+    def _panel_content(self) -> tuple[list[tuple[str, str]], str]:
+        """The current panel's body and its default footer. Both the renderer
+        and _panel_key() go through here, so the cursor can never run past the
+        end of a body that only the renderer knew the length of."""
+        return {
+            "keys": lambda: (self._keys_body(), "esc back · j/k scroll"),
+            "settings": lambda: (self._settings_body(), "↵ open · esc back"),
+            "colors": lambda: (self._colors_body(), "esc back · edit config.toml"),
+            "binds": lambda: (self._binds_body(), "esc back"),
+            "bookmarks": lambda: (self._bookmarks_body(), "↵ go there · esc back"),
+        }[self.mode]()
+
+    def panel_frame(self, cols: int, height: int) -> list[str]:
+        body, footer = self._panel_content()
+        cursor = self.panel_cursor if self.mode in self.CURSOR_PANELS else None
+        if cursor is not None:
+            cursor = max(0, min(cursor, max(0, len(body) - 1)))
+        return self._panel(cols, height, self.PANEL_TITLES[self.mode],
+                           body, self.message or footer, cursor)
+
+    def _panel(self, cols: int, height: int, title: str,
+               body: list[tuple[str, str]], footer: str,
+               cursor: int | None) -> list[str]:
+        """The one panel renderer. Returns a full height-length line list, the
+        same shape frame() does, because paint() will clobber anything else."""
+        c = self.colors
+        border = fg(c["border"])
+        width = max(30, min(cols, 200))
+        inner = width - 2
+        body_h = max(3, height - 4)  # title, body, bottom border, footer
+
+        if cursor is not None:
+            self.panel_top = min(self.panel_top, cursor)
+            self.panel_top = max(self.panel_top, cursor - body_h + 1)
+        self.panel_top = max(0, min(self.panel_top, max(0, len(body) - body_h)))
+
+        text = " " + title + " "
+        fill = max(0, inner - 1 - len(text))
+        lines = [f"{border}╭─{fg(c['accent'])}{BOLD}{text}{RESET}"
+                 f"{border}{'─' * fill}╮{RESET}"]
+        for i in range(body_h):
+            idx = self.panel_top + i
+            if idx >= len(body):
+                lines.append(f"{border}│{RESET}{' ' * inner}{border}│{RESET}")
+                continue
+            plain, styled = body[idx]
+            if len(plain) > inner - 2:
+                plain = plain[:max(0, inner - 3)] + "…"
+                styled = f"{fg(c['file'])}{plain}{RESET}"
+            gap = max(0, inner - 2 - len(plain))
+            row = f" {styled}{' ' * gap} "
+            if cursor is not None and idx == cursor:
+                row = f"{bg(c['selected_bg'])}{row}{RESET}"
+            lines.append(f"{border}│{RESET}{row}{border}│{RESET}")
+        lines.append(f"{border}╰{'─' * inner}╯{RESET}")
+        # Say when the panel is taller than the terminal. Without this the keys
+        # table just stops at whatever the last visible row is and reads as the
+        # complete list -- the exact failure the old truncated hint line had.
+        arrows = ("↑" if self.panel_top else "") + (
+            "↓" if self.panel_top + body_h < len(body) else "")
+        if arrows:
+            footer += f" · {arrows} more"
+        lines.append(f"  {fg(c['dim'])}{footer[:max(0, cols - 3)]}{RESET}")
+
+        while len(lines) < height:
+            lines.append("")
+        return lines[:height]
+
+    def key_label(self, action: str | None, key: str, alias: str) -> str:
+        """What a key prints in a table: the *live* binding for a remappable
+        action, the literal for a fixed one, plus its arrow alias."""
+        label = self.keys.get(action, key) if action else key
+        return f"{label} {alias}" if alias else label
+
+    def _keys_body(self) -> list[tuple[str, str]]:
+        c = self.colors
+        dim, accent, plainc = fg(c["dim"]), fg(c["accent"]), fg(c["file"])
+        out: list[tuple[str, str]] = []
+        for i, (section, rows) in enumerate(KEY_SECTIONS):
+            if i:
+                out.append(("", ""))
+            out.append((section, f"{dim}{section}{RESET}"))
+            labels = [self.key_label(a, k, al) for a, k, al, _d in rows]
+            w = max(len(label) for label in labels)
+            for label, (_a, _k, _al, desc) in zip(labels, rows):
+                pad = label.ljust(w)
+                out.append((f"  {pad}   {desc}",
+                            f"  {accent}{pad}{RESET}   {plainc}{desc}{RESET}"))
+        return out
+
+    def _settings_body(self) -> list[tuple[str, str]]:
+        c = self.colors
+        accent, dim = fg(c["accent"]), fg(c["dim"])
+        saved = sum(1 for slot in "0123456789" if read_bookmark(slot) is not None)
+        counts = {"colors": f"{len(self.colors)} colours",
+                  "binds": f"{len(self.keys)} bound",
+                  "bookmarks": f"{saved} of 10 set"}
+        out = []
+        for panel, label in self.SETTINGS_ROWS:
+            note = counts[panel]
+            out.append((f"  {label.ljust(11)}{note}",
+                        f"  {accent}{label.ljust(11)}{RESET}{dim}{note}{RESET}"))
+        return out
+
+    def _colors_body(self) -> list[tuple[str, str]]:
+        c = self.colors
+        accent, dim = fg(c["accent"]), fg(c["dim"])
+        out = []
+        for name in DEFAULTS["colors"]:
+            value = str(c.get(name, DEFAULTS["colors"][name]))
+            # The swatch is the whole point: hex in a config file is unreadable
+            # until you see it next to the colour it actually produces.
+            out.append((f"  {name.ljust(12)}{value.ljust(10)}████",
+                        f"  {accent}{name.ljust(12)}{RESET}{dim}{value.ljust(10)}"
+                        f"{RESET}{fg(value)}████{RESET}"))
+        return out
+
+    def _binds_body(self) -> list[tuple[str, str]]:
+        c = self.colors
+        accent, plainc = fg(c["accent"]), fg(c["file"])
+        out = []
+        for action, key in self.keys.items():
+            desc = ACTION_DESC[action]
+            out.append((f"  {key.ljust(4)}{desc}",
+                        f"  {accent}{key.ljust(4)}{RESET}{plainc}{desc}{RESET}"))
+        return out
+
+    def _bookmarks_body(self) -> list[tuple[str, str]]:
+        c = self.colors
+        accent, dim, plainc = fg(c["accent"]), fg(c["dim"]), fg(c["file"])
+        out = []
+        for slot in "0123456789":
+            target = read_bookmark(slot)
+            if target is None:
+                out.append((f"  {slot}   —", f"  {accent}{slot}{RESET}   {dim}—{RESET}"))
+                continue
+            # A bookmarked directory can be deleted under you; say so here
+            # rather than only when `b` fails on it.
+            gone = "" if target.is_dir() else "   (missing)"
+            shown = home_short(target)
+            out.append((f"  {slot}   {shown}{gone}",
+                        f"  {accent}{slot}{RESET}   {plainc}{shown}{RESET}"
+                        f"{dim}{gone}{RESET}"))
+        return out
+
+    def _panel_open(self) -> None:
+        """↵ inside a panel. Only the settings menu and the bookmarks list do
+        anything with it; colours and keybinds become editable in a later pass
+        and say so rather than silently ignoring the key."""
+        if self.mode == "settings":
+            self.mode = self.SETTINGS_ROWS[self.panel_cursor][0]
+            self.panel_top = self.panel_cursor = 0
+        elif self.mode == "bookmarks":
+            slot = "0123456789"[self.panel_cursor]
+            target = read_bookmark(slot)
+            if target is None:
+                self.message = f"no bookmark {slot}"
+            elif not target.is_dir():
+                self.message = f"bookmark {slot} no longer exists: {target}"
+            else:
+                # Same two steps `b` takes, then out of the panel: jumping
+                # somewhere and leaving the list covering it would be a lie.
+                self.reveal_path(target)
+                self.mode = None
+                self.message = f"went to bookmark {slot}"
+                self.maybe_publish()
+        else:
+            self.message = "not editable yet -- edit config.toml and relaunch"
+
+    def _panel_key(self, key: str) -> bool:
+        """One keypress while a panel is up. Returns True only for the keys
+        that quit the browser outright.
+
+        `q` still quits from in here, and `esc` is what closes a panel. That
+        is the documented invariant kept deliberately rather than adopting the
+        pager convention: `q` is the one key in this file with no second
+        meaning anywhere, and ESC already carries the context-sensitive one."""
+        if key in ("q", "\x03", "\x04"):
+            return True
+        if key == "ESC":
+            # One level at a time: a submenu falls back to the settings menu,
+            # the settings menu (and the keys table) back to the tree.
+            self.mode = "settings" if self.mode in self.SUBMENUS else None
+            self.panel_top = self.panel_cursor = 0
+            return False
+
+        body, _footer = self._panel_content()
+        last = max(0, len(body) - 1)
+        action = self.binds.get(key)
+        if action == "down":
+            # The keys table has no cursor, so j/k scroll it directly; every
+            # other panel has a flat body and moves a real selection.
+            if self.mode in self.CURSOR_PANELS:
+                self.panel_cursor = min(self.panel_cursor + 1, last)
+            else:
+                self.panel_top = min(self.panel_top + 1, last)
+        elif action == "up":
+            if self.mode in self.CURSOR_PANELS:
+                self.panel_cursor = max(0, self.panel_cursor - 1)
+            else:
+                self.panel_top = max(0, self.panel_top - 1)
+        elif action == "top":
+            self.panel_cursor = self.panel_top = 0
+        elif action == "bottom":
+            self.panel_cursor = self.panel_top = last
+        elif key == "ENTER":
+            self._panel_open()
+        elif action in ("panel_keys", "panel_settings"):
+            # Pressing the door again closes it, the way `?` usually behaves.
+            want = "keys" if action == "panel_keys" else "settings"
+            self.mode = None if self.mode == want else want
+            self.panel_top = self.panel_cursor = 0
+        return False
+
     def render_row(self, idx: int, inner: int, border: str) -> str:
         c = self.colors
         row = self.rows[idx]
@@ -1150,6 +1509,28 @@ class Navigateur:
             had_message = bool(self.message)
             self.message = ""
 
+            if self.mode:
+                # Above the count buffer on purpose: that block eats every
+                # digit, and the bookmarks panel selects rows by digit.
+                if self._panel_key(key):
+                    return  # only q / ctrl-c / ctrl-d get here
+                continue
+
+            if key.isdigit() and (key != "0" or self.count_buf):
+                # "0" alone isn't a count (nothing is bound to a bare 0 here);
+                # only "0" *after* a leading digit extends it, e.g. "10j".
+                self.count_buf += key
+                self.message = self.count_buf
+                continue
+            count = int(self.count_buf) if self.count_buf else 1
+            self.count_buf = ""
+
+            # Dispatch on the resolved action, never on the literal character:
+            # this is what keeps the `?` table and the keys that actually work
+            # from being two different lists. The fixed keys below it are the
+            # rows KEY_SECTIONS marks with action None.
+            action = self.binds.get(key)
+
             if key == "q":
                 return
             elif key == "ESC":
@@ -1167,36 +1548,39 @@ class Navigateur:
             elif key == "ENTER":
                 self.chosen = self.published_dir()
                 return
-            elif key in ("j", "DOWN"):
-                self.move(1)
-            elif key in ("k", "UP"):
-                self.move(-1)
-            elif key in ("l", "RIGHT"):
+            elif action == "down":
+                self.move(count)
+            elif action == "up":
+                self.move(-count)
+            elif action == "enter":
                 self.enter()
-            elif key in ("h", "LEFT"):
+            elif action == "leave":
                 self.leave()
-            elif key == "g":
+            elif action == "top":
                 self.cursor = 0
-            elif key == "G":
+            elif action == "bottom":
                 self.cursor = max(0, len(self.rows) - 1)
-            elif key == "o":
+            elif action == "open":
                 self.open_it()
-            elif key == "O":
+            elif action == "reveal":
                 self.open_it(reveal=True)
-            elif key in ("w", "t"):
-                self.spawn_terminal(new_window=(key == "w"))
+            elif action in ("window", "tab"):
+                self.spawn_terminal(new_window=(action == "window"))
                 # A new tab lands on top of this session and no SIGWINCH fires,
                 # so paint()'s diff would keep a stale frame. Blank prev the way
                 # _resized() does and repaint whole.
                 screen.prev = []
-            elif key == "F":
+            elif action in ("panel_keys", "panel_settings"):
+                self.mode = "keys" if action == "panel_keys" else "settings"
+                self.panel_top = self.panel_cursor = 0
+            elif action == "lead":
                 if self.role == "leader":
                     if self.set_role("solo"):
                         self.message = "stopped leading"
                 elif self.set_role("leader"):
                     self.message = ("leading group " + self.group
                                     + " — its followers track this window")
-            elif key == "f":
+            elif action == "follow":
                 if self.role == "follower":
                     if self.set_role("solo"):
                         self.message = "stopped following"
@@ -1212,7 +1596,7 @@ class Navigateur:
                 elif self.set_role("follower"):
                     self.message = "following the leader of group " + self.group
                     self.sync_from_leader(force=True)  # `f` means "sync me now"
-            elif key == "B":
+            elif action == "bookmark_set":
                 slot = self.read_slot(screen, cols, height,
                                        "bookmark: press a digit 0-9")
                 if slot in ("\x03", "\x04"):
@@ -1224,7 +1608,7 @@ class Navigateur:
                                      f"{home_short(self.published_dir())}")
                 else:
                     self.message = "could not write the bookmark"
-            elif key == "b":
+            elif action == "bookmark_go":
                 slot = self.read_slot(screen, cols, height,
                                        "go to bookmark: press a digit 0-9")
                 if slot in ("\x03", "\x04"):
@@ -1241,23 +1625,24 @@ class Navigateur:
                     else:
                         self.reveal_path(target)
                         self.message = f"went to bookmark {slot}"
-            elif key in ("m", "c", "x"):
-                verb = {"m": "move", "c": "copy", "x": "cut"}[key]
+            elif action in ("op_move", "op_copy", "op_cut"):
+                verb = action[3:]
                 if self.pending_op != verb:
                     # Entering fresh, or switching verb mid-mark -- either way
                     # the current marks (if any) carry over unchanged.
                     self.pending_op = verb
                     n = len(self.marked)
+                    mark = self.keys["mark"]
                     self.message = (f"{n} marked -- {key} to {verb} here" if n
-                                     else f"{verb} mode -- e to mark, {key} to {verb} here")
+                                     else f"{verb} mode -- {mark} to mark, {key} to {verb} here")
                 elif not self.marked:
                     self.pending_op = None
                     self.message = f"{verb} cancelled -- nothing marked"
                 else:
                     self.try_op(screen, cols, height)
-            elif key == "e":
+            elif action == "mark":
                 self.toggle_mark()
-            elif key == ".":
+            elif action == "hidden":
                 self.show_hidden = not self.show_hidden
                 self.rebuild()
             elif key in ("\x04", "\x03"):  # ctrl-d / ctrl-c

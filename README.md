@@ -150,9 +150,32 @@ what the `source` line in your `.zshrc` is for.
 | `e` | mark/unmark the current row, while in move, copy or cut mode |
 | `F` | **lead** this window's group — its followers track this window |
 | `f` | **follow** this window's group — refused if nobody is leading it |
+| `?` | the full key table, laid out and grouped |
+| `,` | settings: your colours, your keys, your bookmarks |
 | `↵` | quit **and** cd your shell here |
-| `q` or `Esc` | quit, leaving your shell where it was — `Esc` instead cancels move/copy/cut mode if one is pending, without quitting |
+| `q` or `Esc` | quit, leaving your shell where it was — `Esc` instead cancels move/copy/cut mode if one is pending, or closes a panel, without quitting |
 | `Ctrl-C` / `Ctrl-D` | quit, same as `q` |
+
+The line at the bottom of the window is deliberately short — five keys, not
+sixteen — because on a narrow terminal a long one just loses its tail without
+telling you. `?` is the whole list, and it is the segment that survives
+longest when the window gets small.
+
+### `?` and `,` — the panels
+
+`?` opens the key table above, grouped and aligned, and reflecting your actual
+bindings rather than the defaults. `,` opens a small menu:
+
+| panel | shows |
+|---|---|
+| colours | every colour in `config.toml`, its hex, and a swatch in that colour |
+| keybinds | every rebindable action and the key it's on |
+| bookmarks | all ten slots, where each points, and which ones are dead |
+
+Inside a panel: `j`/`k` move, `↵` opens the row (in **bookmarks**, `↵` goes
+there and closes the panel), `Esc` backs out one level — submenu → menu →
+browser. **`q` still quits the browser outright, from inside a panel as
+everywhere else**; it is the one key here that never means anything else.
 
 `F` and `f` toggle: pressing either again returns the window to solo. They
 take no argument, so they act on the group the window is already in — they

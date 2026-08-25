@@ -53,7 +53,12 @@ file.
 
 `python3 src/nav.py` run directly prints `navigateur: needs a terminal` and exits 2 unless
 **both** stdin and stdout are TTYs — so the usual "pipe it and read the output" smoke test
-cannot work here. Exercising a change means an interactive terminal.
+cannot work here. Exercising a change means an interactive terminal — with one exception:
+the module *imports* fine, and `frame()` / `panel_frame()` are pure `(cols, height) ->
+list[str]`, so layout arithmetic can be checked headlessly. Point `NAV_STATE` at a temp
+directory first, load `src/nav.py` with `importlib`, and assert `len(frame(c, h)) == h`
+plus every ANSI-stripped line fitting in `c`, at both 40x8 and something large.
+`ast.parse` alone catches none of that.
 
 Shared state lives under `$NAV_STATE` (default `~/.navigateur`; overridable, see
 `src/nav.zsh:12` and `src/nav.py:35`): `config.toml`, `roles/<tty>`, and per group
@@ -166,6 +171,51 @@ needs "where am I" must call it, not recompute the rule. `maybe_publish()` de-du
 the last published value, which is what keeps arrowing between sibling files from firing,
 and returns early unless the role is `leader` — a follower is structurally incapable of
 publishing, rather than merely not doing so.
+
+## The keymap and the panels
+
+`KEY_SECTIONS` (`src/nav.py`) is **one table read by two consumers**: the `?` panel prints
+it, and `run()` dispatches on the actions in it. `run()` resolves `action =
+self.binds.get(key)` and branches on the *action*, never on a literal character — that is
+the whole point. A key literal in the dispatch is a binding the `?` table cannot know
+about, and a row in the table with no matching branch is a lie printed on screen. The
+cheapest check is set equality between the two — `set(DEFAULT_KEYS)` against the actions
+`run()` actually branches on — which is worth re-running by hand after touching either.
+
+`VERB_KEYS` is now a **property derived from `self.keys`**, not a literal dict. It is still
+"the one place that maps a verb to its key" — it just no longer hardcodes the answer, so
+`_hint_line()` cannot advertise `m` after `m` has been rebound. Same reason `_hint_line()`
+and the move/copy/cut messages read `self.keys["mark"]` rather than spelling `e`.
+
+- **Rows with `action = None` are the fixed keys** — `↵`, `esc`, `q`, `^c`/`^d`. They are
+  displayed but never rebindable, and `RESERVED_KEYS` refuses them (plus the digits, which
+  `B`/`b` read as bookmark slots). This is `load_config()`'s rule applied to keys: a typo
+  must never cost you the browser you would use to fix it, so the way *out* is never
+  something the user can spell wrong. Arrows are in `ARROW_KEYS`, applied over the user's
+  bindings in `_build_binds()`, so rebinding `down` cannot steal `↓`.
+- **A panel is a mode, not an overlay.** `Screen.paint()` diffs against `prev`, so anything
+  written outside `frame()`'s return value is clobbered on the next changed line. `frame()`
+  dispatches to `panel_frame()` on `self.mode` and `run()` routes to `_panel_key()` — one
+  paint path, one input path. `read_slot()` is modal *input* only (a single blocking read);
+  a panel needs a loop, which is why it is a mode instead.
+- **`_panel_key()` is called above the `count_buf` block in `run()`**, because that block
+  eats every digit and the bookmarks panel is indexed by digit.
+- **`q` quits from inside a panel; `esc` closes it.** Deliberately not the pager
+  convention. `q` is the one key in this file with no second meaning anywhere, and `ESC`
+  already carries the context-sensitive one (cancel a pending op / back out a level).
+- **Panels with a cursor keep flat bodies** — no headings, no blank rows — so
+  `panel_cursor` is a plain index into the body list. `keys` is the one grouped panel and
+  the one with no cursor. `_panel_content()` is shared by the renderer and the key handler
+  so the cursor can never run past the end of a body only the renderer measured.
+- **Body builders return `(plain, styled)` pairs.** The plain half is what truncation and
+  gap-padding measure — `render_row()`'s trick — and being pure `-> list[...]` is what
+  makes them exercisable without a TTY, which `nav.py` otherwise refuses to run without.
+- **The footer stays ONE line.** `frame()`'s `body_h = max(3, height - 4)` and
+  `_scroll_into_view()` both assume exactly one hint line, and `measure()` clamps to 40x8 —
+  three body rows. A permanent multi-line legend would have to renegotiate both. That is
+  why the table lives behind `?`. `_hint_line()`'s segment list is ordered for its own
+  truncation rule (it drops the *second-to-last* segment first), so `? keys` sits near the
+  front: the surviving segments at 40 cols are the front of the list plus `q quit`.
 
 ## Cross-file invariants
 
