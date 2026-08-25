@@ -2,7 +2,8 @@
 
 A file explorer that lives in the terminal. Expanding tree like the VSCode
 explorer, `hjkl` keys, hex-configurable colours — and one window can take the
-lead and drag your *other* terminals along with it.
+lead and drag your *other* terminals along with it, in as many independent
+groups as you want.
 
 ```
 ╭─ ~/Desktop/navigateur   leading ────────╮
@@ -70,8 +71,8 @@ the function cds there afterwards — the same trick `ranger` and `lf` use.
 | `O` | reveal in Finder (opens the parent with the file selected) |
 | `w` | open this folder in a **new terminal window** |
 | `t` | open this folder in a **new terminal tab** |
-| `F` | make this window the **leader** — the others follow where it goes |
-| `f` | make this window a **follower** of the leader — refused if nobody is leading |
+| `F` | make this window the **leader** of its group — its followers go where it goes |
+| `f` | make this window a **follower** in its group — refused if nobody is leading it |
 | `.` | show/hide dotfiles |
 | `g` / `G` | top / bottom |
 | `↵` | quit **and** cd your shell here |
@@ -128,29 +129,65 @@ the browser, or from a prompt — the two are the same thing:
 | **follow** — this window tracks the leader | `f` | `navigate follow` (or `follower`) |
 | **neither** | `F` / `f` again | `navigate solo` |
 
-`navigate status` says which role this window holds and who the leader is.
+`navigate status` says which role this window holds and who leads each group.
 `navigate follow on|off|toggle|status` still works and means the same thing.
 
-**Following needs somebody to follow.** With no leader anywhere, `navigate
-follow` prints
+**Following needs somebody to follow.** With no leader for that group,
+`navigate follow` prints
 
 ```
-navigateur: no leader — run `n leader` in the window that should lead
+navigateur: no leader for group default — run `n lead default` in the window that should lead
 ```
 
 and changes nothing, exiting 2 — rather than leaving you a follower that will
 never move. `f` in the browser says the same in its status line. Set a leader
-first; the order is `leader` in one window, then `follow` in the others. A
+first; the order is `lead` in one window, then `follow` in the others. A
 window that is *itself* the leader gets the same refusal if it types `follow`:
 it does not count as its own leader, so the refusal cannot leave you with nobody
 leading.
 
-There is **exactly one leader**. Pressing `F` in a second window takes the lead
-away from the first, which notices at its next prompt and goes solo — you never
-have to demote anyone by hand.
+There is **exactly one leader per group**. Pressing `F` in a second window takes
+the lead away from the first *in that group*, which notices at its next prompt
+and goes solo — you never have to demote anyone by hand.
 
 The role belongs to the *window*, not to a browsing session: it survives
 quitting the browser, and lasts until you change it or close the terminal.
+
+### Groups
+
+Add a name and you get a second, independent set of the whole thing:
+
+```sh
+navigate lead 3          # this window leads group 3
+navigate follow 3        # this window follows group 3
+navigate follow on 3     # the same, spelled out
+navigate status          # every group, its leader, its subscriber count
+navigate status 3        # just that one
+```
+
+Group `3` cannot see group `7`: each has its own leader, its own followers, and
+its own broadcasts. Two projects, or two people on one box, no longer fight over
+the single role.
+
+A group name is up to 32 characters of letters, digits, `-` and `_`. Anything
+else is refused — the name becomes a directory under `~/.navigateur/groups/`, so
+`navigate lead ../elsewhere` has to be rejected rather than obeyed. Numbers are
+the obvious names, but `navigate lead docs` reads better and works the same.
+
+**Leaving the name off means the group this window is already in** — `default`
+if it has never joined one, which is why every command in the table above keeps
+doing exactly what it always did. `navigate lead` in a window already leading
+group 3 is a no-op rather than a move to `default`. You are in one group at a
+time: `navigate follow 7` in a window that was following group 3 moves it across
+rather than joining both.
+
+`F` and `f` in the browser take no argument, so they act on **the group this
+window is already in** — they never yank you back to `default`. The title bar
+shows the group next to the role flag when it isn't the default one. Likewise
+`navigate follow toggle` comes back into the group you toggled out of.
+
+Groups exist only while somebody is in one; there is no list to maintain and
+nothing to create in advance.
 
 ### What the followers track
 
@@ -199,20 +236,21 @@ The leader publishes without blocking, using `sysopen -o nonblock` from zsh's
 `zsh/system` module. If that module is missing, the leader still writes the
 shared file below and every follower degrades to lazy — nothing breaks.
 
-`navigate status` also prints the *live* subscriber count (it counts FIFOs, and
-a lazy terminal has none — `0 live-subscribed` while someone is following is
-normal, not a fault).
+`navigate status` also prints the *live* subscriber count per group (it counts
+FIFOs, and a lazy terminal has none — `0 live-subscribed` while someone is
+following is normal, not a fault).
 
 ### Three things that surprise people
 
-The last broadcast directory is also kept in `~/.navigateur/cwd`, and *every*
-follower — live ones included — checks it at each prompt. A window that starts
+The last broadcast directory is also kept in `~/.navigateur/groups/<group>/cwd`,
+and *every* follower — live ones included — checks it at each prompt. A window that starts
 following after the leader has been browsing will therefore jump to that stored
 directory on its next Enter, without any new broadcast.
 
 Terminals closed without `navigate solo` clean themselves up: writing to their
 FIFO returns `ENXIO`, which is exactly the "nobody is reading" signal, so the
-sweep costs no extra work.
+sweep costs no extra work. It only ever sweeps the group being published to, so
+a leftover in a group nobody leads any more waits until somebody does.
 
 A window that is *killed* outright can leave its role behind in
 `~/.navigateur/roles/`. Terminal names get recycled, so a fresh window landing
@@ -238,8 +276,9 @@ follow_default = false   # start this window as the leader
 ```
 
 `follow_default = true` is the **leader** side: it starts every browser session
-as if you had pressed `F`, so that window takes the lead. It does not make any
-terminal follow — that is still `f` / `navigate follow`, per window. A role you
+as if you had pressed `F`, so that window takes the lead **of the `default`
+group** — it fires before there is any window to read a group from. It does not
+make any terminal follow — that is still `f` / `navigate follow`, per window. A role you
 have already set wins over it: the setting only speaks when the window has no
 role yet.
 
@@ -253,7 +292,12 @@ than failing — a typo shouldn't cost you the browser you'd use to fix it.
 | `install.sh` | writes the `source` line into your `.zshrc`; `--uninstall` removes it |
 | `src/nav.py` | the TUI — raw ANSI, never writes data to stdout |
 | `src/nav.zsh` | the `nav()` function (`navigate`/`n` alias it), follow subscription, hooks |
-| `~/.navigateur/` | `config.toml`, `cwd`, `roles/<tty>`, `sub/<tty>.fifo` |
+| `~/.navigateur/` | `config.toml`, `roles/<tty>`, `groups/<group>/{cwd,sub/<tty>.fifo}` |
+
+Upgrading from a version without groups: your role files still read correctly
+(they are taken as group `default`), but the broadcast files moved under
+`groups/`, so a window that was already following needs one `navigate follow` to
+re-subscribe. Deleting `~/.navigateur` returns everything to first-run state.
 
 Hooks install via `add-zsh-hook`, never by assigning `precmd_functions` — Warp
 already has entries there and clobbering the array breaks the terminal.

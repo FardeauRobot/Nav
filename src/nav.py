@@ -33,11 +33,38 @@ except ModuleNotFoundError:  # pragma: no cover - 3.11+ has it
     tomllib = None
 
 STATE = Path(os.environ.get("NAV_STATE", str(Path.home() / ".navigateur")))
-SUB = STATE / "sub"
 ROLES = STATE / "roles"
-CWD_FILE = STATE / "cwd"
-GEN_FILE = STATE / "gen"
+GROUPS = STATE / "groups"
 CONFIG = STATE / "config.toml"
+DEFAULT_GROUP = "default"
+
+# A group name becomes a path component, so `n lead ../../etc` has to be refused
+# before anything builds a path out of it. nav.zsh's _nav_group_ok must accept
+# exactly this set -- the same class of rule as the self_tty() symmetry one.
+_GROUP_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
+
+
+def group_ok(group: str) -> bool:
+    return 1 <= len(group) <= 32 and set(group) <= _GROUP_CHARS
+
+
+# One group's broadcast directory. The group is in the *path* here and in the
+# *content* of roles/<tty>, and the split is forced by which paths are hot:
+# read_role() reads one file by a name it already knows and runs at every prompt
+# through nav.zsh's _nav_reconcile, while publish() globs its subscribers on
+# every cursor move and must not decide membership by reading role files.
+def sub_dir(group: str) -> Path:
+    return GROUPS / group / "sub"
+
+
+def cwd_file(group: str) -> Path:
+    return GROUPS / group / "cwd"
+
+
+def gen_file(group: str) -> Path:
+    return GROUPS / group / "gen"
+
 
 MAX_DEPTH = 40
 
@@ -205,25 +232,33 @@ def self_tty() -> str | None:
     return None
 
 
-def read_role(me: str | None) -> str:
-    """This window's role: leader, follower or solo.
+def read_role(me: str | None) -> tuple[str, str]:
+    """This window's (role, group): leader, follower or solo, and which group.
 
     $NAV_STATE/roles/<tty> is the single source of truth and the seam with the
-    shell. Writing it is all this process can do about a role -- only a shell
-    can register a FIFO with `zle -F` -- so nav.zsh's _nav_reconcile brings the
-    live machinery in line afterwards. An unreadable or junk value degrades to
-    solo rather than costing you the browser."""
+    shell. It holds "<role> <group>"; a bare "leader" with no second field is
+    the pre-groups format and still reads as group `default`, so role files
+    written by an older version stay valid. Writing it is all this process can
+    do about a role -- only a shell can register a FIFO with `zle -F` -- so
+    nav.zsh's _nav_reconcile brings the live machinery in line afterwards. An
+    unreadable or junk value in either field degrades to solo rather than
+    costing you the browser."""
     if me is None:
-        return "solo"
+        return "solo", DEFAULT_GROUP
     try:
-        value = (ROLES / me).read_text().strip()
+        parts = (ROLES / me).read_text().split()
     except OSError:
-        return "solo"
-    return value if value in ("leader", "follower") else "solo"
+        return "solo", DEFAULT_GROUP
+    role = parts[0] if parts else ""
+    group = parts[1] if len(parts) > 1 else DEFAULT_GROUP
+    if role not in ("leader", "follower") or not group_ok(group):
+        return "solo", DEFAULT_GROUP
+    return role, group
 
 
-def find_leader(me: str | None) -> str | None:
-    """The leading tty, or None. The mirror of nav.zsh's _nav_find_leader.
+def find_leader(me: str | None, group: str) -> str | None:
+    """The tty leading `group`, or None. The mirror of nav.zsh's
+    _nav_find_leader.
 
     `me` is excluded: a window asking "is there a leader for me to follow?" must
     not find itself, succeed, and demote -- that leaves nobody leading, which is
@@ -236,75 +271,78 @@ def find_leader(me: str | None) -> str | None:
     for q in entries:
         if q.name == me:
             continue
-        try:
-            if q.read_text().strip() == "leader":
-                return q.name
-        except OSError:
-            pass
+        if read_role(q.name) == ("leader", group):
+            return q.name
     return None
 
 
-def write_role(me: str | None, role: str) -> bool:
-    if me is None:
+def write_role(me: str | None, role: str, group: str = DEFAULT_GROUP) -> bool:
+    if me is None or not group_ok(group):
         return False
     try:
         ROLES.mkdir(parents=True, exist_ok=True)
         if role == "solo":
             (ROLES / me).unlink(missing_ok=True)
         else:
-            (ROLES / me).write_text(role + "\n")
+            (ROLES / me).write_text(role + " " + group + "\n")
     except OSError:
         return False
     if role == "leader":
-        # Exactly one leader. Enforced only here, on promotion -- reading a
-        # role never globs this directory, it reads one file by name.
+        # Exactly one leader *per group*. Enforced only here, on promotion --
+        # reading a role never globs this directory, it reads one file by name.
         try:
             others = [q for q in ROLES.iterdir() if q.name != me]
         except OSError:
             others = []
         for q in others:
-            try:
-                if q.read_text().strip() == "leader":
+            # Parsed, never a prefix match on "leader": with the group in the
+            # content, taking group 3 would otherwise evict group 1's leader.
+            if read_role(q.name) == ("leader", group):
+                try:
                     q.unlink()
-            except OSError:
-                pass
+                except OSError:
+                    pass
     return True
 
 
-def read_cwd() -> str | None:
-    """Where the leader is. Both publishers -- publish() below and nav.zsh's
-    _nav_publish -- write this file, so it is the one place a follower has to
-    look."""
+def read_cwd(group: str) -> str | None:
+    """Where the group's leader is. Both publishers -- publish() below and
+    nav.zsh's _nav_publish -- write this file, so it is the one place a follower
+    has to look."""
     try:
-        return CWD_FILE.read_text().strip() or None
+        return cwd_file(group).read_text().strip() or None
     except OSError:
         return None
 
 
-def read_msg(dest: str) -> str:
+def read_msg(dest: str, group: str) -> str:
     """The identity of the last broadcast: its generation stamp and its
     directory. A publish is an event, not a value -- a leader re-selecting the
     directory a follower has since left writes a byte-identical `cwd`, and
     without the stamp that is indistinguishable from the stale file the
     follower already declined. `self.seen` holds one of these, never a path."""
     try:
-        gen = GEN_FILE.read_text().strip()
+        gen = gen_file(group).read_text().strip()
     except OSError:
         gen = ""
     return gen + ":" + dest
 
 
-def publish(path: Path, me: str | None) -> None:
-    """Broadcast a directory to every subscribed terminal."""
+def publish(path: Path, me: str | None, group: str) -> None:
+    """Broadcast a directory to every terminal subscribed to `group`."""
     payload = (str(path) + "\n").encode()
     try:
-        STATE.mkdir(parents=True, exist_ok=True)
-        CWD_FILE.write_text(str(path) + "\n")
-        GEN_FILE.write_text(str(time.time_ns()) + "\n")  # see read_msg()
+        # sub/ too: a leader can publish into a group no follower has joined.
+        sub_dir(group).mkdir(parents=True, exist_ok=True)
+        cwd_file(group).write_text(str(path) + "\n")
+        gen_file(group).write_text(str(time.time_ns()) + "\n")  # see read_msg()
     except OSError:
         pass
+    # The group is in the path, never looked up per subscriber: this glob runs
+    # on every cursor move through maybe_publish(), and deciding membership by
+    # reading role files here would put a second glob plus N reads on it.
     try:
-        fifos = sorted(SUB.glob("*.fifo"))
+        fifos = sorted(sub_dir(group).glob("*.fifo"))
     except OSError:
         return
     for f in fifos:
@@ -315,7 +353,8 @@ def publish(path: Path, me: str | None) -> None:
         except OSError as exc:
             if exc.errno == errno.ENXIO:
                 # No reader: that terminal died without cleanup. Garbage
-                # collection rides along on the write we were doing anyway.
+                # collection rides along on the write we were doing anyway --
+                # and so only ever covers the group being published to.
                 try:
                     f.unlink()
                 except OSError:
@@ -449,14 +488,14 @@ class Navigateur:
         self.rows: list[Row] = []
         self.me = self_tty()
         self.published: str | None = None
-        self.role = read_role(self.me)
+        self.role, self.group = read_role(self.me)
         self.seen = None  # the message a follower has already acted on
         if self.role == "solo" and bool(cfg["behavior"]["follow_default"]):
             # The old broadcast-by-default switch, read as "start this window
-            # leading". A saved role always wins: the config only gets a say
-            # when there is no role file at all.
-            write_role(self.me, "leader")
-            self.role = "leader"
+            # leading the default group". A saved role always wins: the config
+            # only gets a say when there is no role file at all.
+            write_role(self.me, "leader", DEFAULT_GROUP)
+            self.role, self.group = "leader", DEFAULT_GROUP
         self.chosen: Path | None = None
         self.message = ""
         self.rebuild()
@@ -510,7 +549,7 @@ class Navigateur:
         if target == self.published:
             return  # de-dupe: arrowing between sibling files must not re-fire
         self.published = target
-        publish(Path(target), self.me)
+        publish(Path(target), self.me, self.group)
 
     def select_path(self, path: Path) -> None:
         for i, row in enumerate(self.rows):
@@ -518,23 +557,29 @@ class Navigateur:
                 self.cursor = i
                 return
 
-    def set_role(self, role: str) -> bool:
-        if not write_role(self.me, role):
+    def set_role(self, role: str, group: str | None = None) -> bool:
+        """F and f take no argument, so they act on this window's current group
+        -- falling back to `default` -- rather than yanking a window out of the
+        group it joined with `n lead <g>` / `n follow <g>`."""
+        group = group or self.group or DEFAULT_GROUP
+        if not write_role(self.me, role, group):
             self.message = "cannot write the role file"
             return False
         self.role = role
+        self.group = group
         self.published = None  # a fresh leader must state where it is
+        self.seen = None       # a seen-stamp never carries across groups
         return True
 
     def sync_from_leader(self, force: bool = False) -> bool:
-        """Follower poll. Reads $NAV_STATE/cwd rather than this terminal's
+        """Follower poll. Reads the group's `cwd` rather than this terminal's
         FIFO: the shell holds that FIFO open for `zle -F` and a second reader
         would race it for the bytes. The shell keeps its own copy of the
         message, so quitting still lands the shell in the same place."""
-        dest = read_cwd()
+        dest = read_cwd(self.group)
         if dest is None:
             return False
-        msg = read_msg(dest)
+        msg = read_msg(dest, self.group)
         if msg == self.seen and not force:
             return False
         self.seen = msg  # recorded before acting, like _NAV_SEEN in nav.zsh
@@ -814,10 +859,14 @@ class Navigateur:
         can never widen the box."""
         c = self.colors
         border, dim, accent = fg(c["border"]), fg(c["dim"]), fg(c["accent"])
+        # Named groups are shown, the default one is not: the browser is
+        # otherwise the one place that cannot say which group you are in, and
+        # `room` below is derived from len(flag), so the box still cannot widen.
+        tag = "" if self.group == DEFAULT_GROUP else " " + self.group
         if self.role == "leader":
-            flag, flag_fg = " leading ", accent
+            flag, flag_fg = " leading" + tag + " ", accent
         elif self.role == "follower":
-            flag, flag_fg = " following ", dim
+            flag, flag_fg = " following" + tag + " ", dim
         else:
             flag, flag_fg = "", ""
         room = inner - 3 - len(flag)
@@ -922,20 +971,23 @@ class Navigateur:
                     if self.set_role("solo"):
                         self.message = "stopped leading"
                 elif self.set_role("leader"):
-                    self.message = "leading — followers track this window"
+                    self.message = ("leading group " + self.group
+                                    + " — its followers track this window")
             elif key == "f":
                 if self.role == "follower":
                     if self.set_role("solo"):
                         self.message = "stopped following"
-                elif find_leader(self.me) is None:
+                elif find_leader(self.me, self.group or DEFAULT_GROUP) is None:
                     # Promotion only. The role file is shared with the shell, so
                     # an unguarded `f` would recreate the leaderless follower
                     # `n follow` now refuses. A message and a return, never a
                     # raise: these keys must not be the ones that kill the
                     # browser.
-                    self.message = "no leader — press F in the window that should lead"
+                    self.message = ("no leader for group "
+                                    + (self.group or DEFAULT_GROUP)
+                                    + " — press F in the window that should lead")
                 elif self.set_role("follower"):
-                    self.message = "following the leader"
+                    self.message = "following the leader of group " + self.group
                     self.sync_from_leader(force=True)  # `f` means "sync me now"
             elif key == ".":
                 self.show_hidden = not self.show_hidden
