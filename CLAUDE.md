@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A terminal file explorer (`src/nav.py`, 773 lines) plus its shell integration
+A terminal file explorer (`src/nav.py`, ~3050 lines) plus its shell integration
 (`src/nav.zsh`, 308 lines). Stdlib-only Python 3 + zsh: no dependencies, no build step, no
 package manager, **no test suite**. `README.md` documents the user-facing surface (keys,
 install, follow modes, colour keys) — this file covers what a reader of any single source
@@ -179,12 +179,132 @@ Consequences that are easy to undo by accident:
 ## One publish rule, one function
 
 `Navigateur.published_dir()` (`src/nav.py:475`) is the nearest enclosing directory of the
-highlighted row — the row itself when it is a folder, its parent when it is a file. Both the
-following terminals *and* `↵`/`$NAV_LASTDIR` read this single function. A new feature that
-needs "where am I" must call it, not recompute the rule. `maybe_publish()` de-dupes against
-the last published value, which is what keeps arrowing between sibling files from firing,
-and returns early unless the role is `leader` — a follower is structurally incapable of
+highlighted row — the row itself when it is a folder, its parent when it is a file — **except**
+in the one window between `reveal_path()` teleporting the tree and the next deliberate cursor
+move, when `self.root` itself is the target and has no row to read it off; see `root_selected`
+below. Both the following terminals *and* `↵`/`$NAV_LASTDIR` read this single function. A new
+feature that needs "where am I" must call it, not recompute the rule. `maybe_publish()` de-dupes
+against the last published value, which is what keeps arrowing between sibling files from
+firing, and returns early unless the role is `leader` — a follower is structurally incapable of
 publishing, rather than merely not doing so.
+
+`self.root` is structurally never a row — `rebuild()` only walks its *children* into `self.rows`
+— so `reveal_path()`'s re-root branches (bookmark jump, follower-sync jump) have no row to select
+onto and used to fall back to `cursor = 0`. Since `list_dir()` sorts directories before files,
+row 0 of a real folder is almost always a subdirectory of the target, not the target — so
+`published_dir()` reported one level too deep until the user's next cursor move (the reported
+bug: `↵` right after a bookmark jump cd'd into a subfolder of the bookmark). `root_selected` is
+the fix: true only from the instant `reveal_path()` teleports until the next deliberate cursor
+move (`move()`, `leave()`'s two navigational branches, `top`/`bottom`) — `enter()` deliberately
+does **not** clear it, since expanding the highlighted row to peek inside it never moves the
+cursor and must not silently change what `↵` will confirm.
+
+## Opening a file with `↵`
+
+`↵` is now three-way: a pending op confirms, a **file** opens via `open_file()`, a **folder**
+does the old `self.chosen = self.published_dir(); return`. `open_file()` routes on
+`row.path.suffix.lower()` against `MD_SUFFIXES` / `EDIT_SUFFIXES` / `EDIT_NAMES` (module
+level, next to `LINUX_TERMINALS`) and falls through to `open_it()` for everything else — so
+the desktop handoff stays the single default rather than being reimplemented.
+
+- **The `root_selected` gate is the whole subtlety.** `published_dir()` deliberately ignores
+  the row in the window after a `reveal_path()` teleport, because `self.root` is structurally
+  never a row. A file-opening `↵` that read `self.current()` without that gate would hijack
+  the first `↵` after every bookmark jump and open whatever file `list_dir()`'s sort put on
+  row 0 — the exact class of bug `root_selected` was added to fix. The branch is
+  `not self.root_selected and row is not None and not row.is_dir`.
+- **Opening a file falls through, never `return`s** — same reason the `pending_op` confirm
+  does: the message has to reach the next paint.
+- **`editor_argv()` is the one editor resolver**, shared by `E` (`edit_it()`) and by `↵`
+  (`_run_editor()`), for the same reason `key_ok()` and `group_ok()` are single: two copies
+  would drift. `$VISUAL` → `$EDITOR` → `nvim` → `vim`, `shlex.split` so `code -w` survives.
+  `edit_it()` used to hardcode `"nvim"`; the fallback chain makes that a no-op wherever
+  neither variable is set.
+- **`_run_editor()` uses `Screen.suspend()`/`resume()`, never `restore()`** — see that
+  section under Cross-file invariants. It is the same loan `E` always took, now taken from
+  two call sites.
+- **`MD_SUFFIXES` means "the reader", unconditionally.** An earlier pass routed markdown to
+  `open -a Warp` behind a `_warp_can_render()` gate, on the belief that Warp's Markdown
+  Viewer would render it — inferred from the bundle's `CFBundleDocumentTypes` registration
+  and **never actually observed**. The reader retires the question by not asking it: there is
+  no `TERM_PROGRAM` test, no platform split and no dependency on what happens to be
+  installed, which is what makes this a routing rule rather than an integration. Do not
+  reintroduce a viewer handoff for `.md`; a link cannot be followed from another app's tab.
+- **The routing tables are not config.** `DEFAULTS`, `DEFAULT_CONFIG_TEXT` and the README
+  table move together by the rule above; keeping the extension lists as module constants is
+  what keeps all three out of this change.
+- **`↵` stays a fixed key.** No new bindable action, so `RESERVED_KEYS` and the
+  `set(DEFAULT_KEYS)`-vs-`run()` set equality are unchanged — the reader's keys are all
+  panel-local — but `KEY_SECTIONS`' `↵` row and `_hint_line()`'s `"↵ read/open/cd"` segment
+  are both descriptions of behaviour that just moved, and the README key table with them.
+
+## The markdown reader
+
+The sixth panel mode, and the only one whose body is a *document*. It exists because a
+markdown viewer in another application cannot follow a link back into the tree — and because
+the vault this was written for uses plain relative links (`[x](notions/y.md)`, 1239 of them)
+rather than wikilinks (2 files), so following one is path resolution against the containing
+file and needs no index, no vault and no external tool. **Obsidian is not involved**: it is
+Electron and cannot be embedded, and its CLI resolves paths relative to one vault, so
+anything built on it is silently useless on `navigateur`'s own `README.md`.
+
+- **Parse once, render per width. That split is the feature's spine.** `md_parse()` assigns
+  every link an id — its index in the returned list, in document order — and `md_render()`
+  only wraps. A rendered *line number* is a function of the pane, so a `SIGWINCH` mid-read
+  would move a selection stored as one. `self.reader.link` is therefore an id, and the
+  renderer (the only thing that knows the width) resolves it through `linemap`. `blockmap`
+  does the same job for an anchor. Store a line number anywhere in reader state and the bug
+  comes back, silently, only on resize.
+- **`dwidth()`, never `len()`, everywhere a column is counted.** CLAUDE.md already warned
+  that a double-width glyph tears the box; the reader is what made it a daily event (75 of
+  those 179 files carry emoji). `_panel()`'s gap-padding and truncation now use it too, which
+  fixes every panel, not just this one. Ambiguous-width (`A`) — which is what *every*
+  box-drawing character reports — is deliberately counted as **1**: correct outside a CJK
+  locale, and the one assumption here that would break inside one.
+- **The plain and styled halves must have identical trailing whitespace.** `_panel()` sizes
+  the right-hand gap from `dwidth(plain)` alone, so a pad that survives only in the styled
+  half walks the border out by exactly that many cells. `_md_paint()` strips trailing space
+  tokens from both, and `_md_cell()` skips the last column's padding for the same reason.
+  A vault-wide sweep asserting `plain == styled` when no styles are passed is what catches it.
+- **`_md_clip()` clips *spans*, not joined text.** Cutting the joined string would throw the
+  link ids away with the span boundaries, so a table narrow enough to clip would silently
+  lose the links on that row. `_md_cell()` also reports the cell's **original** ids: a link
+  whose label got cut off is still on that row, and `linemap`'s job is to name a row to
+  scroll to, not to certify that the label survived.
+- **`_md_paint()` coalesces neighbouring same-style tokens.** `_md_flow()` splits on spaces,
+  so without it every word arrives in its own escape pair — three times the bytes through
+  `paint()`'s diff, and no phrase in the output is contiguous enough for anything to match.
+- **Anchors are Obsidian's rule, not GitHub's.** `md_anchor_line()` unquotes and compares
+  against the heading's **literal text** (`#Abstract%20class` → `Abstract class` → `##
+  Abstract class`). GitHub's lowercase-and-hyphenate slug matches none of this vault's 367
+  same-file anchors. Verified 97/97 on `GLOSSAIRE.md`; case-insensitive containment is the
+  fallback, not the rule.
+- **A same-file `#anchor` pushes no history.** It is a scroll, not a document change, and 367
+  of them would make `⌫` useless.
+- **`_panel_content()` takes a width; its second caller has none.** `_panel_key()` calls it
+  for `len(body)` to clamp — CLAUDE.md names that sharing on purpose — and the reader is the
+  one panel whose body length depends on the pane. `_panel()` therefore caches `panel_w` and
+  `panel_h` at paint time and the handler reads those: a keypress always follows a paint.
+  They are seeded in `__init__` so that is a nicety, not a correctness argument.
+- **`_panel_key()` takes `screen`.** `E` inside the reader hands the real terminal to a
+  foreground editor, which needs `suspend()`/`resume()`. There is exactly one call site, in
+  `run()`, so threading it beat the alternative of handling one panel's key outside the
+  panel handler.
+- **`b"[Z"` had to join `key()`'s escape table.** Shift-Tab is CSI Z; undecoded it falls
+  through to `"ESC"`, so walking links backwards would have closed the reader.
+- **`esc` closes, `q` quits — the reader does not get the pager convention.** It is in
+  neither `SUBMENUS` nor `CURSOR_PANELS`, so `esc` goes straight to the tree and drops the
+  history with it. Back is `⌫` (and `h`/`←`, which mean "leave" in the tree and "back" here —
+  different input paths, no conflict).
+- **Every failure keeps you where you are.** `open_reader()` returns False with a message for
+  an unreadable file, and a link to something missing leaves the document on screen. Same
+  rule as `open_it()`/`spawn_terminal()`: these keys must never be the ones that raise out of
+  the browser.
+- **The markdown layer is pure and is the only part testable without a TTY.** `md_parse` /
+  `md_render` / `md_anchor_line` / `dwidth` are `str,list -> list`. The check that matters is
+  a sweep of every `.md` in the vault at several widths asserting three things at once: no
+  line exceeds the width by `dwidth`, `plain == styled` with no styles, and **every link id
+  appears in `linemap`** — that last one is what caught `_md_cell` eating ids.
 
 ## The keymap and the panels
 
@@ -196,10 +316,12 @@ about, and a row in the table with no matching branch is a lie printed on screen
 cheapest check is set equality between the two — `set(DEFAULT_KEYS)` against the actions
 `run()` actually branches on — which is worth re-running by hand after touching either.
 
-`VERB_KEYS` is now a **property derived from `self.keys`**, not a literal dict. It is still
-"the one place that maps a verb to its key" — it just no longer hardcodes the answer, so
-`_hint_line()` cannot advertise `m` after `m` has been rebound. Same reason `_hint_line()`
-and the move/copy/cut messages read `self.keys["mark"]` rather than spelling `e`.
+There is no `VERB_KEYS` any more: the confirm step for a pending move/copy/cut/delete is
+the fixed `↵`, which `RESERVED_KEYS` keeps out of reach of rebinding, so there is no live
+keymap to derive it from and no "hint advertises a stale rebound letter" hazard to guard
+against — `_hint_line()` and `toggle_mark()` just spell `↵` literally. `self.keys["mark"]`
+is a different case: `e` **can** be rebound, so `_hint_line()` and the move/copy/cut
+messages still read it live rather than spelling `e`.
 
 - **Rows with `action = None` are the fixed keys** — `↵`, `esc`, `q`, `^c`/`^d`. They are
   displayed but never rebindable, and `RESERVED_KEYS` refuses them (plus the digits, which
@@ -208,6 +330,9 @@ and the move/copy/cut messages read `self.keys["mark"]` rather than spelling `e`
   must never cost you the browser you would use to fix it, so the way *out* is never
   something the user can spell wrong. Arrows are in `ARROW_KEYS`, applied over the user's
   bindings in `_build_binds()`, so rebinding `down` cannot steal `↓`.
+- **There are six panel modes**: `keys`, `settings`, `colors`, `binds`, `bookmarks` and
+  `reader`. The reader is the only one with a body that depends on the pane width; see its
+  own section.
 - **A panel is a mode, not an overlay.** `Screen.paint()` diffs against `prev`, so anything
   written outside `frame()`'s return value is clobbered on the next changed line. `frame()`
   dispatches to `panel_frame()` on `self.mode` and `run()` routes to `_panel_key()` — one
@@ -334,6 +459,17 @@ Each of these looks like removable noise and is load-bearing:
   same rule as "stdout is the display, never a data channel", and a dropped wakeup byte only
   costs one late repaint; and the whole thing is wrapped so a failure degrades to the old
   press-a-key behaviour rather than costing you the browser.
+- **`Screen.suspend()`/`resume()` are a loan, not a shutdown.** `edit_it()` (`E`) is the first
+  code that hands the real terminal to a foreground child (`nvim`), and `restore()` is the
+  wrong tool for giving it back: `restore()` also calls `set_wakeup_fd(-1)` and clears
+  `self.saved`, which is correct for a one-time exit but would leave a SIGHUP arriving while
+  `nvim` owns the terminal unable to restore afterward. `suspend()`/`resume()` touch only the
+  raw-mode/alt-screen/cursor state and deliberately leave the wakeup pipe and signal handlers
+  armed the whole time — a `SIGWINCH` firing mid-edit just blanks `prev`, harmless with nothing
+  painting. `resume()`'s `termios.tcflush(TCIFLUSH)` is load-bearing, not cosmetic: without it,
+  a keystroke queued during `nvim`'s own exit sequence is still sitting in the tty buffer when
+  `key()` next reads, and decodes as a real keypress in the browser — a stray `ESC` with no
+  `pending_op` would quit it outright.
 - **Both backspaces erase.** The colour prompt accepts `\x7f` **and** `\x08` — which one a
   terminal sends depends on its erase setting, and a typing prompt where the erase key
   silently does nothing is the kind of bug nobody reports and everybody hates.
@@ -357,9 +493,12 @@ a user's files rather than corrupting a scratch file that a restart repairs.
 four. `m`, `c`, `x` and `d` all funnel into the same `toggle_mark()` path; `marked`/
 `pending_op` themselves don't distinguish delete from the other three. Only two things read
 `pending_op`'s specific value: the confirm-prompt wording (`toggle_mark()`, `_hint_line()`,
-`run()`'s dispatch — all three use the same `where = "" if verb == "delete" else " here"`
-substitution rather than duplicating the message-building code) and, in `run()`'s dispatch
-block, which second-press method runs. **Delete does not share `_op_batch()`/`try_op()`** —
+the `op_*` dispatch in `run()` — all three use the same `where = "" if verb == "delete"
+else " here"` substitution rather than duplicating the message-building code) and, in
+`run()`'s `ENTER` branch, which confirm method runs (`try_delete()` for delete, `try_op()`
+otherwise) — the `op_*` keys (`m`/`c`/`x`/`d`) themselves only ever enter or refresh the
+mode now; they no longer trigger the confirm on a repeated press. **Delete does not share
+`_op_batch()`/`try_op()`** —
 it has its own `_delete_batch()` (nested-mark collapse only, no destination to check for
 collisions or nesting-into-itself) and `try_delete()` (see below), because there is no
 destination for a delete to collide with or land in. **Cut is move**, not a third filesystem
@@ -383,12 +522,6 @@ move's collision/nesting guarantees.
   verb at entry, since that needs an extra branch and a special-case message for no behavioural
   gain — the confirm prompt already names the verb (and, for move/copy/cut, the destination),
   so a fat-fingered switch is visible before anything happens.
-- **`VERB_KEYS` is now `{"move": "m", "copy": "c", "cut": "x", "delete": "d"}`** (a property
-  derived from `self.keys`, not a literal dict — see the keymap section above) — the one place
-  that maps a verb to its key. Earlier, when only move/copy existed, message text derived the
-  key letter as `verb[0]` — that stopped working the moment `x`/`"cut"` existed, since `"copy"`
-  and `"cut"` both start with `c`. Don't reintroduce a `verb[0]`-style shortcut if a fifth verb
-  is ever added; extend the table instead.
 - **Delete confirms per item, not once for the whole batch.** `try_delete()` loops the batch
   and calls `read_slot()` again for each item: `y` deletes this one and advances, `Y` deletes
   this one and every item still left without asking again, anything else stops the rest of the
@@ -456,8 +589,25 @@ move's collision/nesting guarantees.
   always quit, pending op or not, since it's the one key with no double meaning anywhere else
   in the file. Don't refold these back into one `elif`; that's exactly the merge that made `ESC`
   unable to mean anything but quit.
+- **`ENTER` is context-sensitive the same way, and for the same reason.** With a `pending_op`
+  set it confirms instead of quitting: nothing marked cancels the mode (same message the old
+  verb-key-repeat-with-no-marks path used to produce), otherwise it calls `try_delete()` or
+  `try_op()` and falls through to `maybe_publish()` — never `return`s while a confirm just
+  happened, since the batch/message needs to reach the next paint. With no `pending_op` it
+  splits again on the row: a file goes to `open_file()` (and falls through for the same
+  reason), while a folder — or a `root_selected` teleport, see "Opening a file with `↵`"
+  below — keeps the old unconditional `self.chosen = self.published_dir(); return`. This is *why* the
+  `op_move`/`op_copy`/`op_cut`/`op_delete` dispatch no longer branches on `self.pending_op`'s
+  value at all — pressing `m`/`c`/`x`/`d` again just re-enters/refreshes the mode
+  unconditionally now, since confirming moved to `ENTER` alone. `VERB_KEYS` (a property that
+  used to map verb → key so the hint could name the live confirm key) is gone along with it:
+  the confirm key is now the fixed `↵`, which `RESERVED_KEYS` keeps un-rebindable, so nothing
+  needs deriving from the keymap any more.
 
 ## Scope
+
+The README lists fuzzy search, git decorations and a bash integration as deliberate
+omissions; the markdown reader was added after that list was written.
 
 `start.txt` is the original user request. It explains *why* the bindings are what they are,
 but it is **not** the spec of record — the README key table is authoritative where the two
