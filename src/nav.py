@@ -21,11 +21,13 @@ import signal
 import subprocess
 import sys
 import shlex
+import re
 import termios
 import time
+import unicodedata
 import tty
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 try:
     import tomllib
@@ -160,14 +162,15 @@ KEY_SECTIONS: list[tuple[str, list[tuple[str | None, str, str, str]]]] = [
         ("up", "k", "↑", "up a row"),
         ("enter", "l", "→", "expand a folder"),
         ("leave", "h", "←", "collapse, or go up"),
+        ("collapse_all", "=", "", "collapse everything to the root"),
         ("top", "g", "", "first row"),
         ("bottom", "G", "", "last row"),
-        (None, "↵", "", "cd here and quit"),
+        (None, "↵", "", "read a .md, open a file, or cd here and quit"),
     ]),
     ("opening", [
         ("open", "o", "", "open in the default app"),
         ("reveal", "O", "", "reveal in the file manager"),
-        ("edit", "E", "", "edit in neovim"),
+        ("edit", "E", "", "edit in your editor"),
         ("window", "w", "", "new terminal window here"),
         ("tab", "t", "", "new terminal tab here"),
         ("hidden", ".", "", "show or hide dotfiles"),
@@ -419,6 +422,50 @@ def home_short(p: Path) -> str:
     return "~" + s[len(home):] if s == home or s.startswith(home + os.sep) else s
 
 
+# Variation selectors and the ZWJ: they steer the glyph before them rather
+# than occupying a cell of their own.
+ZERO_WIDTH = frozenset("\ufe0f\ufe0e\u200d")
+
+
+def dwidth(s: str) -> int:
+    """Display columns, not len(). The two are different often enough in this
+    project's own reading material to tear the box: an emoji-presentation glyph
+    occupies two cells and len() calls it one.
+
+    East-Asian W and F are 2. Combining marks and the emoji variation selector
+    U+FE0F are 0, so "⌨️" measures 2 rather than 3. Ambiguous ('A' -- which
+    is what every box-drawing character reports) is counted as 1: correct for
+    Warp and for any terminal not running under a CJK locale, and the single
+    assumption here that breaks if one ever is."""
+    total = 0
+    for ch in s:
+        if unicodedata.combining(ch) or ch in ZERO_WIDTH:
+            continue
+        total += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return total
+
+
+def dtrunc(s: str, width: int, ellipsis: str = "…") -> str:
+    """s cut to at most `width` display columns, with an ellipsis when it had
+    to cut. Never splits a wide glyph in half: the cell budget is checked
+    before the character is taken, not after."""
+    if dwidth(s) <= width:
+        return s
+    if width <= 0:
+        return ""
+    room = width - dwidth(ellipsis)
+    if room <= 0:
+        return ellipsis[:width]
+    out, used = [], 0
+    for ch in s:
+        w = dwidth(ch)
+        if used + w > room:
+            break
+        out.append(ch)
+        used += w
+    return "".join(out) + ellipsis
+
+
 # ------------------------------------------------------------------- the desktop
 
 IS_MAC = sys.platform == "darwin"
@@ -450,6 +497,494 @@ def launch_detached(args: list[str], cwd: str | None = None) -> None:
     subprocess.Popen(args, cwd=cwd, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
                      start_new_session=True)
+
+
+# What `↵` on a file does, by extension. Deliberately module-level constants and
+# not config settings: DEFAULTS, DEFAULT_CONFIG_TEXT and the README table have to
+# move together, and none of them needs to move for a routing table nobody has
+# asked to tune. MD_SUFFIXES means "open in the reader" -- on every platform and
+# in every terminal, which is exactly what makes it a routing rule and not an
+# integration with something else that happens to be installed.
+MD_SUFFIXES = frozenset({".md", ".markdown", ".mdown"})
+EDIT_SUFFIXES = frozenset({
+    ".c", ".h", ".cc", ".cpp", ".cxx", ".c++", ".hpp", ".hh", ".hxx",
+    ".py", ".rs", ".go", ".rb", ".pl", ".lua", ".java", ".swift",
+    ".js", ".ts", ".jsx", ".tsx", ".css", ".html", ".sql",
+    ".sh", ".zsh", ".bash", ".vim", ".el",
+    ".toml", ".json", ".yaml", ".yml", ".ini", ".cfg", ".conf",
+    ".txt", ".rst", ".csv", ".log", ".env", ".diff", ".patch",
+})
+# Files a suffix rule cannot reach. Matched on the whole name, which covers both
+# the genuinely extensionless (Makefile, Dockerfile) and dotfiles like .zshrc,
+# whose Path.suffix is "" -- the leading dot is a stem, not an extension.
+EDIT_NAMES = frozenset({
+    "Makefile", "makefile", "GNUmakefile", "Dockerfile", "Vagrantfile",
+    "Rakefile", "Gemfile", "CMakeLists.txt", "LICENSE", "COPYING", "TODO",
+    ".zshrc", ".zshenv", ".zprofile", ".bashrc", ".bash_profile", ".profile",
+    ".gitignore", ".gitconfig", ".gitattributes", ".editorconfig", ".vimrc",
+})
+
+
+def editor_argv() -> list[str] | None:
+    """The one place that decides which editor runs -- shared by `E` and by `↵`
+    on a source file, so the two can never drift into disagreeing about it.
+
+    $VISUAL before $EDITOR (the historical rule: VISUAL is the full-screen one,
+    and this is a full-screen context), then nvim, then vim. shlex.split so a
+    value like "code -w" survives as an argv rather than becoming a filename
+    with a space in it. None means nothing usable is installed, which the
+    callers turn into a message rather than an exception.
+
+    A GUI $EDITOR with no wait flag returns instantly under suspend()/resume()
+    and just flickers the screen. That is the user's environment being wrong for
+    this use, not something to second-guess here."""
+    for var in ("VISUAL", "EDITOR"):
+        raw = os.environ.get(var, "").strip()
+        if raw:
+            try:
+                argv = shlex.split(raw)
+            except ValueError:  # an unbalanced quote in $EDITOR
+                continue
+            if argv and shutil.which(argv[0]):
+                return argv
+    for fallback in ("nvim", "vim"):
+        if shutil.which(fallback):
+            return [fallback]
+    return None
+
+
+# --------------------------------------------------------------------- markdown
+#
+# A reader, not an editor and not a spec-complete renderer. Everything below is
+# pure -- str/list in, list out -- for the same reason the panel body builders
+# are: nav.py refuses to run unless both fds are TTYs, so the only way any of
+# this gets exercised is by importing it.
+#
+# The split that matters is parse-once / render-per-width. md_parse() is where
+# links get their identity (an index into the returned list, in document order);
+# md_render() only wraps. A rendered LINE NUMBER is a function of the pane
+# width, so a SIGWINCH mid-read would move a selection that was stored as one --
+# which is why the reader remembers a link id and the renderer, the only thing
+# that knows the width, resolves it to a line.
+
+MD_STYLE_TAGS = ("text", "code", "bold", "em", "link", "linksel",
+                 "head", "quote", "rule", "bullet", "table")
+
+# Inline syntax, in precedence order -- `code` first so that a literal
+# [a](b) inside backticks stays literal. Emphasis is deliberately only the
+# asterisk forms: this vault is full of snake_case and __dunder__ identifiers,
+# and _ as an emphasis marker turns half of them italic.
+MD_INLINE_RX = re.compile(
+    r"(?P<code>`[^`\n]+`)"
+    r"|(?P<link>!?\[(?P<label>[^\]]*)\]\((?P<target>[^)\s]*)"
+    r"(?:\s+\"[^\"]*\")?\))"
+    r"|(?P<bold>\*\*[^*\n]+\*\*)"
+    r"|(?P<em>\*[^*\n]+\*)"
+)
+MD_HEADING_RX = re.compile(r"^(#{1,6})\s+(.*)$")
+MD_LIST_RX = re.compile(r"^(\s*)([-*+]|\d+[.)])\s+(.*)$")
+MD_RULE_RX = re.compile(r"^(?:\*\s*){3,}$|^(?:-\s*){3,}$|^(?:_\s*){3,}$")
+MD_TASK_RX = re.compile(r"^\[([ xX])\]\s+")
+# A table's second line: the |---|:--:| separator. "-" is required, so a two-row
+# quote block or a stray pipe in prose is not mistaken for a table.
+MD_TABLE_SEP_RX = re.compile(r"^\|[\s|:-]*-[\s|:-]*\|?$")
+
+
+class MDBlock:
+    """One parsed block. `spans` is a list of (text, tag, link_id) and is where
+    inline styling lives; `raw` is the unparsed line list of a fence; `rows` is
+    a table's list of rows of cell-spans."""
+
+    __slots__ = ("kind", "level", "text", "spans", "raw", "rows",
+                 "indent", "marker")
+
+    def __init__(self, kind: str, *, level: int = 0, text: str = "",
+                 spans: list | None = None, raw: list | None = None,
+                 rows: list | None = None, indent: int = 0,
+                 marker: str = "") -> None:
+        self.kind, self.level, self.text = kind, level, text
+        self.spans = spans or []
+        self.raw = raw or []
+        self.rows = rows or []
+        self.indent, self.marker = indent, marker
+
+
+def md_inline(text: str, links: list[tuple[str, str]]) -> list[tuple[str, str, int | None]]:
+    """Text -> (text, tag, link_id) spans, appending every link found to
+    `links` so that ids are assigned in document order across the whole file
+    and stay stable no matter how the page is later wrapped."""
+    out: list[tuple[str, str, int | None]] = []
+    pos = 0
+    for m in MD_INLINE_RX.finditer(text):
+        if m.start() > pos:
+            out.append((text[pos:m.start()], "text", None))
+        pos = m.end()
+        if m.lastgroup and m.group("code"):
+            out.append((m.group("code")[1:-1], "code", None))
+        elif m.group("link") is not None:
+            # A label is routinely `[`projets/`](…)`; the backticks are markup
+            # around the label, not part of it.
+            label = m.group("label").replace("`", "").strip() or m.group("target")
+            target = m.group("target")
+            if m.group("link").startswith("!"):
+                # An image is not something a terminal can show. Name it and
+                # move on rather than pretending the link is followable text.
+                out.append((f"[image: {label}]", "dim", None))
+            else:
+                links.append((label, target))
+                out.append((label, "link", len(links) - 1))
+        elif m.group("bold") is not None:
+            out.append((m.group("bold")[2:-2], "bold", None))
+        else:
+            out.append((m.group("em")[1:-1], "em", None))
+    if pos < len(text):
+        out.append((text[pos:], "text", None))
+    return out or [("", "text", None)]
+
+
+def _md_cells(line: str) -> list[str]:
+    """A table row's cells. Leading and trailing pipes are the border, not an
+    empty first and last column."""
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [c.strip() for c in s.split("|")]
+
+
+def md_parse(text: str) -> tuple[list[MDBlock], list[tuple[str, str]]]:
+    """(blocks, links). One line-oriented pass, no lookbehind.
+
+    Fences are taken whole and never looked inside -- that is what stops a
+    shell comment in a code sample from being promoted to a heading, which on
+    this vault's 162 fenced files would be constant."""
+    lines = text.splitlines()
+    blocks: list[MDBlock] = []
+    links: list[tuple[str, str]] = []
+    i = 0
+    # YAML frontmatter (73 files here). Skipped, not rendered: it is metadata
+    # for Obsidian, and showing it pushes the actual first heading off screen.
+    if lines and lines[0].strip() == "---":
+        for j in range(1, min(len(lines), 200)):
+            if lines[j].strip() in ("---", "..."):
+                i = j + 1
+                break
+    while i < len(lines):
+        raw = lines[i]
+        s = raw.strip()
+        if s.startswith("```") or s.startswith("~~~"):
+            marker = s[:3]
+            body: list[str] = []
+            i += 1
+            while i < len(lines) and not lines[i].strip().startswith(marker):
+                body.append(lines[i])
+                i += 1
+            i += 1  # the closing fence, or past the end if it was never closed
+            blocks.append(MDBlock("fence", text=s[3:].strip(), raw=body))
+            continue
+        if not s:
+            blocks.append(MDBlock("blank"))
+            i += 1
+            continue
+        if MD_RULE_RX.match(s):
+            blocks.append(MDBlock("rule"))
+            i += 1
+            continue
+        m = MD_HEADING_RX.match(s)
+        if m:
+            title = m.group(2).strip().rstrip("#").strip()
+            blocks.append(MDBlock("heading", level=len(m.group(1)), text=title,
+                                  spans=md_inline(title, links)))
+            i += 1
+            continue
+        if s.startswith(">"):
+            buf = []
+            while i < len(lines) and lines[i].strip().startswith(">"):
+                buf.append(lines[i].strip()[1:].strip())
+                i += 1
+            blocks.append(MDBlock("quote", spans=md_inline(" ".join(buf).strip(), links)))
+            continue
+        if (s.startswith("|") and i + 1 < len(lines)
+                and MD_TABLE_SEP_RX.match(lines[i + 1].strip())):
+            rows = [_md_cells(s)]
+            i += 2  # the header and its separator
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                rows.append(_md_cells(lines[i]))
+                i += 1
+            blocks.append(MDBlock("table", rows=[[md_inline(c, links) for c in r]
+                                                 for r in rows]))
+            continue
+        m = MD_LIST_RX.match(raw)
+        if m:
+            indent, marker, rest = m.group(1), m.group(2), m.group(3)
+            i += 1
+            # A continuation line is indented and starts nothing of its own.
+            while (i < len(lines) and lines[i].strip()
+                   and lines[i][:1] in (" ", "\t")
+                   and not MD_LIST_RX.match(lines[i])
+                   and lines[i].strip()[:1] not in ("#", ">", "|")
+                   and not lines[i].strip().startswith("```")):
+                rest += " " + lines[i].strip()
+                i += 1
+            task = MD_TASK_RX.match(rest)
+            if task:
+                bullet, rest = ("✓" if task.group(1) != " " else "☐"), rest[task.end():]
+            else:
+                bullet = "•" if marker in ("-", "*", "+") else marker
+            blocks.append(MDBlock("list", indent=len(indent.expandtabs(4)),
+                                  marker=bullet, spans=md_inline(rest, links)))
+            continue
+        buf = [s]
+        i += 1
+        while i < len(lines):
+            t = lines[i].strip()
+            if (not t or t[:1] in ("#", ">", "|") or t.startswith("```")
+                    or t.startswith("~~~") or MD_LIST_RX.match(lines[i])
+                    or MD_RULE_RX.match(t)):
+                break
+            buf.append(t)
+            i += 1
+        blocks.append(MDBlock("para", spans=md_inline(" ".join(buf), links)))
+    return blocks, links
+
+
+def _md_paint(prefix: str, toks: list, styles: dict, sel: int | None) -> tuple:
+    """One finished line -> (plain, styled, link_ids_on_it).
+
+    Trailing whitespace is dropped from BOTH halves before anything measures
+    them: _panel() pads to `inner - dwidth(plain)`, so a space that survives
+    only in the styled half pushes the right border out by exactly that much."""
+    while toks and not toks[-1][0].strip():
+        toks.pop()
+    plain = prefix + "".join(t for t, _, _ in toks)
+    ids = {lid for _, _, lid in toks if lid is not None}
+    if not styles:
+        return plain, plain, ids
+    parts = [styles.get("frame", ""), prefix, RESET if styles.get("frame") else ""]
+    # Coalesce neighbouring tokens that share a style before emitting. _md_flow
+    # splits on spaces, so without this every word of a heading arrives wrapped
+    # in its own escape pair -- three times the bytes, and it breaks the text up
+    # so thoroughly that nothing downstream can match a phrase in the output.
+    runs: list[tuple[str, str]] = []
+    for text, tag, lid in toks:
+        if lid is not None:
+            tag = "linksel" if lid == sel else "link"
+        if runs and runs[-1][1] == tag:
+            runs[-1] = (runs[-1][0] + text, tag)
+        else:
+            runs.append((text, tag))
+    for text, tag in runs:
+        pre = styles.get(tag, "")
+        parts.append(f"{pre}{text}{RESET}" if pre else text)
+    return plain, "".join(parts), ids
+
+
+def _md_flow(spans: list, width: int, first: str, cont: str,
+             styles: dict, sel: int | None) -> list[tuple]:
+    """Greedy word wrap on dwidth, never len. Returns one entry per output
+    line. A single token too wide for the pane is hard-split rather than
+    allowed to overflow -- a 753-character line exists in this vault."""
+    toks: list[tuple[str, str, int | None]] = []
+    for text, tag, lid in spans:
+        for piece in re.split(r"( +)", text):
+            if piece:
+                toks.append((piece, tag, lid))
+    out: list[tuple] = []
+    line: list = []
+    prefix = first
+    used = dwidth(first)
+    for piece, tag, lid in toks:
+        w = dwidth(piece)
+        if not piece.strip() and not line:
+            continue  # a wrap swallowed the space that would have led this line
+        if line and used + w > width:
+            out.append(_md_paint(prefix, line, styles, sel))
+            line, prefix, used = [], cont, dwidth(cont)
+            if not piece.strip():
+                continue
+        while not line and dwidth(prefix) + w > width:
+            room = width - dwidth(prefix)
+            if room <= 0:
+                break
+            head = dtrunc(piece, room, "")
+            if not head:
+                break
+            out.append(_md_paint(prefix, [(head, tag, lid)], styles, sel))
+            piece, prefix = piece[len(head):], cont
+            w, used = dwidth(piece), dwidth(cont)
+        line.append((piece, tag, lid))
+        used += w
+    if line or not out:
+        out.append(_md_paint(prefix, line, styles, sel))
+    return out
+
+
+def _md_clip(spans: list, width: int) -> list:
+    """Spans cut to `width` display columns, span structure intact.
+
+    Cutting the joined plain text instead would be simpler and would throw the
+    link ids away with the span boundaries -- and a link whose id is gone is a
+    link the reader cannot select, so a table narrow enough to clip would
+    silently lose half the links on the page."""
+    out, used = [], 0
+    for text, tag, lid in spans:
+        w = dwidth(text)
+        if used + w <= width:
+            out.append((text, tag, lid))
+            used += w
+            continue
+        if used >= width:
+            return out  # no room even for the ellipsis
+        room = width - used - 1  # leave a column for the ellipsis
+        head = dtrunc(text, max(0, room), "") if room > 0 else ""
+        if head:
+            out.append((head, tag, lid))
+        out.append(("…", "dim", None))
+        return out
+    return out
+
+
+def _md_cell(spans: list, width: int, styles: dict, sel: int | None,
+             pad: bool = True) -> tuple:
+    """A table cell, clipped to `width` columns and space-padded to exactly
+    that -- except in the last column, where the padding would be trailing
+    whitespace. Both halves get the same padding or neither does.
+
+    The ids reported are the cell's ORIGINAL ones, not the clipped ones: a
+    link whose label got cut off is still on this row, and linemap's job is to
+    say which row to scroll to, not whether the label survived."""
+    ids = {lid for _, _, lid in spans if lid is not None}
+    p, s, _clipped = _md_paint("", _md_clip(list(spans), width), styles, sel)
+    fill = " " * max(0, width - dwidth(p)) if pad else ""
+    return p + fill, s + fill, ids
+
+
+def _md_table(block: MDBlock, width: int, styles: dict, sel: int | None) -> list[tuple]:
+    """Columns padded to their widest cell, shrunk proportionally until the row
+    fits. Tables are in 144 of this vault's 179 files -- leaving them as raw
+    pipes would make the majority of what the user reads look broken."""
+    rows = block.rows
+    ncol = max((len(r) for r in rows), default=0)
+    if not ncol:
+        return []
+    grid = [list(r) + [[("", "text", None)]] * (ncol - len(r)) for r in rows]
+    widths = [max(dwidth("".join(t for t, _, _ in row[i])) for row in grid)
+              for i in range(ncol)]
+    avail = max(ncol, width - 3 * (ncol - 1))
+    while sum(widths) > avail:
+        widest = widths.index(max(widths))
+        if widths[widest] <= 1:
+            break
+        widths[widest] -= 1
+    dim = styles.get("frame", "")
+    bar = f"{dim} │ {RESET}" if dim else " │ "
+    out: list[tuple] = []
+    for n, row in enumerate(grid):
+        # The last column is deliberately NOT padded: its padding is trailing
+        # whitespace, and _panel() sizes the gap from the plain half alone --
+        # so a pad that survives only in the styled half walks the right
+        # border out by exactly that many cells.
+        cells = [_md_cell(row[i], widths[i], styles, sel, pad=i < ncol - 1)
+                 for i in range(ncol)]
+        out.append((" │ ".join(c[0] for c in cells),
+                    bar.join(c[1] for c in cells),
+                    set().union(*[c[2] for c in cells])))
+        if n == 0:  # the header rule, drawn rather than echoed from the source
+            rule = "─┼─".join("─" * w for w in widths)
+            out.append((rule, f"{dim}{rule}{RESET}" if dim else rule, set()))
+    return out
+
+
+def md_render(blocks: list[MDBlock], width: int, styles: dict | None = None,
+              sel: int | None = None) -> tuple[list[tuple[str, str]], dict, dict]:
+    """(lines, linemap, blockmap) at this width.
+
+    `lines` is the (plain, styled) pair list _panel() already speaks. `linemap`
+    is link id -> the first line it appears on and `blockmap` is block index ->
+    its first line: both are how a width-independent identity (a link, a
+    heading) is resolved to a scroll position that is anything but."""
+    styles = styles or {}
+    width = max(8, width)
+    lines: list[tuple[str, str]] = []
+    linemap: dict[int, int] = {}
+    blockmap: dict[int, int] = {}
+    for n, b in enumerate(blocks):
+        blockmap[n] = len(lines)
+        if b.kind == "blank":
+            painted = [("", "", set())]
+        elif b.kind == "rule":
+            rule = "─" * width
+            painted = [(rule, f"{styles.get('rule', '')}{rule}"
+                        f"{RESET if styles.get('rule') else ''}", set())]
+        elif b.kind == "fence":
+            # Not wrapped: re-flowing code lies about it. The gutter is what
+            # says "this block is verbatim" without a box around it.
+            gut = f"{styles.get('frame', '')}│ {RESET}" if styles.get("frame") else "│ "
+            painted = []
+            for ln in b.raw:
+                cut = dtrunc(ln.expandtabs(4), width - 2)
+                code = styles.get("code", "")
+                painted.append(("│ " + cut,
+                                gut + (f"{code}{cut}{RESET}" if code else cut),
+                                set()))
+        elif b.kind == "heading":
+            pad = "  " * max(0, b.level - 2)
+            painted = _md_flow(b.spans, width, pad, pad + "  ",
+                               {**styles, "text": styles.get("head", "")}, sel)
+            if b.level <= 2:
+                under = "─" * min(width, max(1, dwidth(painted[-1][0])))
+                painted.append((under, f"{styles.get('head', '')}{under}"
+                                f"{RESET if styles.get('head') else ''}", set()))
+        elif b.kind == "quote":
+            painted = _md_flow(b.spans, width, "▏ ", "▏ ",
+                               {**styles, "text": styles.get("quote", "")}, sel)
+        elif b.kind == "list":
+            pad = " " * min(b.indent, max(0, width - 8))
+            painted = _md_flow(b.spans, width, f"{pad}{b.marker} ",
+                               pad + " " * (dwidth(b.marker) + 1), styles, sel)
+        elif b.kind == "table":
+            painted = _md_table(b, width, styles, sel)
+        else:
+            painted = _md_flow(b.spans, width, "", "", styles, sel)
+        for plain, styled, ids in painted:
+            for lid in ids:
+                linemap.setdefault(lid, len(lines))
+            lines.append((plain, styled))
+    return lines, linemap, blockmap
+
+
+class MDDoc:
+    """One open document. `link` is an index into `links` -- a width-independent
+    identity, which is the whole reason it is not a line number: rendered lines
+    are a function of the pane, so a SIGWINCH would otherwise silently move the
+    selection out from under the reader."""
+
+    __slots__ = ("path", "blocks", "links", "link")
+
+    def __init__(self, path: Path, blocks: list[MDBlock],
+                 links: list[tuple[str, str]]) -> None:
+        self.path, self.blocks, self.links = path, blocks, links
+        self.link = 0
+
+
+def md_anchor_line(blocks: list[MDBlock], blockmap: dict, anchor: str) -> int | None:
+    """Where `#Abstract%20class` points. Obsidian's rule here is unquote and
+    compare against the heading's literal text -- NOT GitHub's
+    lowercase-and-hyphenate slug, which would miss every one of the 367
+    same-file anchors in this vault. Verified 6/6 against GLOSSAIRE.md.
+    Case-insensitive containment is the fallback, not the rule."""
+    want = unquote(anchor).strip()
+    if not want:
+        return None
+    heads = [(n, b.text) for n, b in enumerate(blocks) if b.kind == "heading"]
+    for n, text in heads:
+        if text == want:
+            return blockmap.get(n)
+    for n, text in heads:
+        if want.lower() in text.lower():
+            return blockmap.get(n)
+    return None
 
 
 # ------------------------------------------------------------------------- follow
@@ -762,6 +1297,10 @@ class Screen:
             return {
                 b"[A": "UP", b"[B": "DOWN", b"[C": "RIGHT", b"[D": "LEFT",
                 b"OA": "UP", b"OB": "DOWN", b"OC": "RIGHT", b"OD": "LEFT",
+                # CSI Z. Without this row Shift-Tab decodes as a bare ESC,
+                # which in a panel means "close it" -- so walking links
+                # backwards would quit the reader.
+                b"[Z": "BACKTAB",
             }.get(seq, "ESC")
         if ch in (b"\r", b"\n"):
             return "ENTER"
@@ -782,17 +1321,6 @@ class Row:
 
 
 class Navigateur:
-    # "cut" and "copy" both start with c, so the key can't be read off the
-    # verb name (verb[0]) the way move/copy could -- this is still the one
-    # place that maps a verb to the key that triggers it, but it is now
-    # *derived* from the live keymap rather than hardcoded. Spell it out as a
-    # literal again and rebinding `m` makes the hint line advertise a key that
-    # no longer does anything.
-    @property
-    def VERB_KEYS(self) -> dict[str, str]:
-        return {verb: self.keys["op_" + verb]
-                for verb in ("move", "copy", "cut", "delete")}
-
     def __init__(self, root: Path, cfg: dict) -> None:
         self.root = root
         self.cfg = cfg
@@ -802,6 +1330,10 @@ class Navigateur:
         self.marked: set[str] = set()
         self.pending_op: str | None = None  # None, "move", "copy", "cut", or "delete"
         self.cursor = 0
+        self.root_selected = False  # see reveal_path(): True only from a
+        # teleport until the next deliberate cursor move -- self.root can
+        # never be a row, so this stands in for "the cursor" when it's root
+        # itself that was just selected.
         self.top = 0
         self.rows: list[Row] = []
         self.me = self_tty()
@@ -833,6 +1365,22 @@ class Navigateur:
         # a hex value into edit_buf). Both live only while a panel is up.
         self.panel_edit: str | None = None
         self.edit_buf = ""
+        # The reader is the sixth panel mode. reader_stack is the back history
+        # -- (path, scroll, link) so that coming back restores the page you
+        # were on AND the link you were on, not just the file. reader_seek is
+        # an anchor waiting to be resolved: only the renderer knows the width,
+        # so only the renderer can turn a heading into a scroll position.
+        self.reader: MDDoc | None = None
+        self.reader_stack: list[tuple[Path, int, int]] = []
+        self.reader_seek: str | None = None
+        self._reader_map: dict[int, int] = {}
+        self._reader_blockmap: dict[int, int] = {}
+        # The body width of the last painted panel. _panel_content() needs a
+        # width for the reader, and its second caller -- _panel_key(), which
+        # reads len(body) to clamp -- has none to give: a keypress always
+        # follows a paint, so the paint leaves it here. Seeded rather than left
+        # unset, so the ordering is a nicety and not a correctness argument.
+        self.panel_w, self.panel_h = 76, 20
         self.rebuild()
 
     def _build_binds(self) -> dict[str, str]:
@@ -878,7 +1426,17 @@ class Navigateur:
     def published_dir(self) -> Path:
         """THE publish rule: the nearest enclosing directory of the highlighted
         row -- the row itself when it is a directory, its parent when it is a
-        file. Everything (followers, $NAV_LASTDIR) reads this one function."""
+        file. Everything (followers, $NAV_LASTDIR) reads this one function.
+
+        root_selected short-circuits this the instant reveal_path() teleports
+        the tree to a bookmark/leader target: self.root can never be a row,
+        so there is nothing for the cursor to land on except row 0 -- almost
+        always a subdirectory of the target, since list_dir() sorts
+        directories first. Without this check published_dir() would report
+        that subdirectory until a deliberate move/leave/top/bottom cleared
+        the flag."""
+        if self.root_selected:
+            return self.root
         row = self.current()
         if row is None:
             return self.root
@@ -943,7 +1501,16 @@ class Navigateur:
     def reveal_path(self, target: Path) -> None:
         """Put the cursor on target: expand the ancestors when it is under the
         current root, otherwise re-root there -- the same move `h` makes when
-        it runs out of parents."""
+        it runs out of parents.
+
+        The re-root branches put target where self.root is: self.root can
+        never itself be a row (rebuild() only walks its children), so there
+        is no row to select onto and cursor falls back to 0 -- landing on
+        row 0's subdirectory, not target. root_selected is what
+        published_dir() checks first so that case still reports target. The
+        reset at the top keeps a second, in-tree reveal_path() call from
+        inheriting a stale True left by an earlier out-of-tree one."""
+        self.root_selected = False
         try:
             rel = target.relative_to(self.root)
         except ValueError:
@@ -951,10 +1518,12 @@ class Navigateur:
             self.open_node(target)
             self.rebuild()
             self.cursor = 0
+            self.root_selected = True
             return
         if not rel.parts:
             self.rebuild()
             self.cursor = 0
+            self.root_selected = True
             return
         node = self.root
         for part in rel.parts:
@@ -1010,6 +1579,7 @@ class Navigateur:
     def move(self, delta: int) -> None:
         if self.rows:
             self.cursor = max(0, min(self.cursor + delta, len(self.rows) - 1))
+            self.root_selected = False
 
     def enter(self) -> None:
         """l -- expand a folder. On a file, expand nothing; the publish rule
@@ -1023,7 +1593,10 @@ class Navigateur:
 
     def leave(self) -> None:
         """h -- collapse if expanded, else jump to the parent row, else re-root
-        one level up. That last case is the `..` from start.txt."""
+        one level up. That last case is the `..` from start.txt. The middle
+        and last cases move the cursor to a different row on purpose, so both
+        clear root_selected; the first collapses in place without moving off
+        the current row, same as enter(), so it doesn't."""
         row = self.current()
         if row is not None and row.is_dir and self.is_open(row.path):
             self.close_node(row.path)
@@ -1032,6 +1605,7 @@ class Navigateur:
         if row is not None and row.depth > 0:
             parent = row.path.parent
             self.select_path(parent)
+            self.root_selected = False
             return
         parent = self.root.parent
         if parent == self.root:
@@ -1041,6 +1615,25 @@ class Navigateur:
         self.open_node(old)
         self.rebuild()
         self.select_path(old)
+        self.root_selected = False
+
+    def collapse_all(self) -> None:
+        """= -- collapse every expanded folder back to the root's direct
+        children. Re-selects the depth-0 ancestor of the row the cursor was
+        on, the same "don't strand the cursor" concern leave() satisfies for
+        a single collapse -- but here the cursor's own row can vanish
+        entirely, so it isn't free the way it is for one collapse."""
+        row = self.current()
+        target = row.path if row is not None else None
+        self.expanded.clear()
+        self.rebuild()
+        if target is not None:
+            try:
+                rel = target.relative_to(self.root)
+            except ValueError:
+                rel = None
+            if rel is not None and rel.parts:
+                self.select_path(self.root / rel.parts[0])
 
     def open_it(self, reveal: bool = False) -> None:
         """o / O -- hand the highlighted row to the desktop.
@@ -1090,26 +1683,59 @@ class Navigateur:
         return ["xdg-open", str(path.parent if reveal else path)]
 
     def edit_it(self, screen: Screen) -> None:
-        """E -- open the highlighted row (file or folder) in nvim, in the
+        """E -- open the highlighted row (file or folder) in the editor, in the
         foreground, in this terminal. Unlike open_it()'s GUI handoff or
-        spawn_terminal()'s detached window, nvim needs the real tty, so the
-        alt screen and raw mode step aside for it via Screen.suspend()/
-        resume() rather than the Popen-and-forget pattern those two use."""
+        spawn_terminal()'s detached window, a terminal editor needs the real
+        tty, so the alt screen and raw mode step aside for it via
+        Screen.suspend()/resume() rather than the Popen-and-forget pattern
+        those two use."""
         row = self.current()
         if row is None:
             return
-        if not shutil.which("nvim"):
-            self.message = "nvim not found"
+        self._run_editor(screen, row.path)
+
+    def _run_editor(self, screen: Screen, path: Path) -> None:
+        """The terminal-editor handoff, shared by `E` and by `↵` on a source
+        file. The suspend/resume pair is the whole point: restore() would also
+        clear self.saved and disarm the wakeup fd, which is right for quitting
+        and wrong for a loan."""
+        argv = editor_argv()
+        if argv is None:
+            self.message = "no editor -- set $EDITOR, or install nvim"
             return
         screen.suspend()
         try:
-            subprocess.run(["nvim", str(row.path)], check=False)
+            subprocess.run(argv + [str(path)], check=False)
         except OSError as exc:
-            self.message = f"nvim failed: {exc}"
+            self.message = f"{argv[0]} failed: {exc}"
         finally:
             screen.resume()
-        self.rebuild()  # nvim can rename/create/delete via netrw or :w
-        self.select_path(row.path)
+        self.rebuild()  # an editor can rename/create/delete under us
+        self.select_path(path)
+
+    def open_file(self, row: Row, screen: Screen) -> None:
+        """`↵` on a file. Three routes, decided by extension:
+
+        markdown opens in the reader, in this frame, on every platform and in
+        every terminal; anything else textual goes to the editor in this
+        terminal; anything else falls through to open_it(), the desktop's
+        default app.
+
+        Markdown used to be handed to `open -a Warp` on the belief that its
+        Markdown Viewer would render it -- inferred from the bundle's document
+        handler registration and never actually observed. The reader settles
+        that question by not asking it, and by being the only route that can
+        follow a link with the keyboard and come straight back.
+
+        Every failure sets a message and returns: `↵` must never be the key
+        that raises out of the browser."""
+        suffix = row.path.suffix.lower()
+        if suffix in MD_SUFFIXES:
+            self.open_reader(row.path)
+        elif suffix in EDIT_SUFFIXES or row.path.name in EDIT_NAMES:
+            self._run_editor(screen, row.path)
+        else:
+            self.open_it()
 
     def spawn_terminal(self, new_window: bool) -> None:
         """w / t -- open a new terminal window or tab already cd'd here.
@@ -1271,10 +1897,9 @@ class Navigateur:
             self.marked.add(key)
         n = len(self.marked)
         verb = self.pending_op
-        letter = self.VERB_KEYS[verb]
         where = "" if verb == "delete" else " here"
-        self.message = (f"{n} marked -- {letter} to {verb}{where}" if n
-                        else f"{verb} mode -- e to mark, {letter} to {verb}{where}")
+        self.message = (f"{n} marked -- ↵ to {verb}{where}" if n
+                        else f"{verb} mode -- e to mark, ↵ to {verb}{where}")
 
     def _op_batch(self, dest: Path) -> list[Path] | None:
         """The marked set, reduced to what actually needs to move/copy/cut:
@@ -1311,9 +1936,10 @@ class Navigateur:
         return batch
 
     def try_op(self, screen: Screen, cols: int, height: int) -> None:
-        """m/c/x, second press -- validate the batch, confirm with `y`, then
-        move, copy or cut per self.pending_op. Any reply other than `y` is a
-        full cancel, mirroring the B/b prompt's "anything else cancels" rule."""
+        """↵, once something is marked -- validate the batch, confirm with
+        `y`, then move, copy or cut per self.pending_op. Any reply other than
+        `y` is a full cancel, mirroring the B/b prompt's "anything else
+        cancels" rule."""
         verb = self.pending_op
         dest = self.published_dir()
         batch = self._op_batch(dest)
@@ -1425,12 +2051,13 @@ class Navigateur:
         return top
 
     def try_delete(self, screen: Screen, cols: int, height: int) -> None:
-        """d, second press -- unlike move/copy/cut's one whole-batch prompt,
-        delete confirms per item: `y` deletes this one and asks again for the
-        next, `Y` deletes this one and every item still left in the batch
-        without asking again. Anything else is still try_op's "anything but y
-        cancels" rule -- it stops the rest of the batch, not just this item,
-        since a delete has no destination left to go clean up by hand."""
+        """↵, once something is marked -- unlike move/copy/cut's one
+        whole-batch prompt, delete confirms per item: `y` deletes this one
+        and asks again for the next, `Y` deletes this one and every item
+        still left in the batch without asking again. Anything else is still
+        try_op's "anything but y cancels" rule -- it stops the rest of the
+        batch, not just this item, since a delete has no destination left to
+        go clean up by hand."""
         batch = self._delete_batch()
         if not batch:
             self.marked.clear()
@@ -1556,12 +2183,11 @@ class Navigateur:
             hint = self.message
         elif self.pending_op:
             verb = self.pending_op
-            letter = self.VERB_KEYS[verb]
             n = len(self.marked)
             mark = self.keys["mark"]
             where = "" if verb == "delete" else " here"
-            hint = (f"{verb} mode: {n} marked -- {mark} to mark, {letter} to {verb}{where}"
-                    if n else f"{verb} mode -- {mark} to mark, {letter} to {verb}{where}")
+            hint = (f"{verb} mode: {n} marked -- {mark} to mark, ↵ to {verb}{where}"
+                    if n else f"{verb} mode -- {mark} to mark, ↵ to {verb}{where}")
         else:
             # Deliberately short. The full list used to live here and was
             # truncated segment by segment, so on a narrow terminal most of the
@@ -1575,7 +2201,7 @@ class Navigateur:
             keys = self.keys
             segs = [f"{keys['leave']}{keys['down']}{keys['up']}{keys['enter']} move",
                     f"{keys['panel_keys']} keys",
-                    "↵ cd here",
+                    "↵ read/open/cd",
                     f"{keys['panel_settings']} settings",
                     "q quit"]
             hint = " · ".join(segs)
@@ -1603,10 +2229,15 @@ class Navigateur:
     CURSOR_PANELS = frozenset({"settings", "colors", "binds", "bookmarks"})
     SUBMENUS = frozenset({"colors", "binds", "bookmarks"})
 
-    def _panel_content(self) -> tuple[list[tuple[str, str]], str]:
+    def _panel_content(self, width: int) -> tuple[list[tuple[str, str]], str]:
         """The current panel's body and its default footer. Both the renderer
         and _panel_key() go through here, so the cursor can never run past the
-        end of a body that only the renderer knew the length of."""
+        end of a body that only the renderer knew the length of.
+
+        `width` exists for the reader alone -- it is the one panel whose body
+        length depends on the pane, because its text is wrapped into it. The
+        other five ignore it. _panel_key() has no width of its own and passes
+        self.panel_w, the value the last paint left behind."""
         if self.panel_edit == "bind":
             return self._binds_body(), "press any key · esc cancels"
         if self.panel_edit == "color":
@@ -1617,19 +2248,29 @@ class Navigateur:
             "colors": lambda: (self._colors_body(), "↵ edit · esc back"),
             "binds": lambda: (self._binds_body(), "↵ rebind · esc back"),
             "bookmarks": lambda: (self._bookmarks_body(), "↵ go there · esc back"),
+            "reader": lambda: (self._reader_body(width), self._reader_footer()),
         }[self.mode]()
 
     def panel_frame(self, cols: int, height: int) -> list[str]:
-        body, footer = self._panel_content()
+        inner = max(30, min(cols, 200)) - 2
+        body, footer = self._panel_content(inner - 2)
         cursor = self.panel_cursor if self.mode in self.CURSOR_PANELS else None
         if cursor is not None:
             cursor = max(0, min(cursor, max(0, len(body) - 1)))
-        return self._panel(cols, height, self.PANEL_TITLES[self.mode],
-                           body, self.message or footer, cursor)
+        title = self.PANEL_TITLES.get(self.mode, "")
+        scroll_to = None
+        if self.mode == "reader" and self.reader is not None:
+            # The title is the file, not a constant -- elided from the LEFT,
+            # the same rule _title_line() uses, because the tail of a name is
+            # the informative half.
+            title = dtrunc(self.reader.path.name, max(4, inner - 14))
+            scroll_to = self._reader_target()
+        return self._panel(cols, height, title,
+                           body, self.message or footer, cursor, scroll_to)
 
     def _panel(self, cols: int, height: int, title: str,
                body: list[tuple[str, str]], footer: str,
-               cursor: int | None) -> list[str]:
+               cursor: int | None, scroll_to: int | None = None) -> list[str]:
         """The one panel renderer. Returns a full height-length line list, the
         same shape frame() does, because paint() will clobber anything else."""
         c = self.colors
@@ -1638,13 +2279,19 @@ class Navigateur:
         inner = width - 2
         body_h = max(3, height - 4)  # title, body, bottom border, footer
 
-        if cursor is not None:
-            self.panel_top = min(self.panel_top, cursor)
-            self.panel_top = max(self.panel_top, cursor - body_h + 1)
+        # What _panel_key() will read; see _panel_content(). A keypress always
+        # follows a paint, so the paint is where these get their real values.
+        self.panel_w, self.panel_h = inner - 2, body_h
+        # scroll_to is the reader's half of this: a cursor is a row to land ON
+        # and highlight, a scroll target is a line to merely bring into view.
+        pin = cursor if cursor is not None else scroll_to
+        if pin is not None:
+            self.panel_top = min(self.panel_top, pin)
+            self.panel_top = max(self.panel_top, pin - body_h + 1)
         self.panel_top = max(0, min(self.panel_top, max(0, len(body) - body_h)))
 
         text = " " + title + " "
-        fill = max(0, inner - 1 - len(text))
+        fill = max(0, inner - 1 - dwidth(text))
         lines = [f"{border}╭─{fg(c['accent'])}{BOLD}{text}{RESET}"
                  f"{border}{'─' * fill}╮{RESET}"]
         for i in range(body_h):
@@ -1653,10 +2300,13 @@ class Navigateur:
                 lines.append(f"{border}│{RESET}{' ' * inner}{border}│{RESET}")
                 continue
             plain, styled = body[idx]
-            if len(plain) > inner - 2:
-                plain = plain[:max(0, inner - 3)] + "…"
+            # dwidth, not len: an emoji-presentation glyph is two cells wide
+            # and len() calls it one, which walks the right border out by one
+            # column per glyph. 75 of the files this reader opens carry emoji.
+            if dwidth(plain) > inner - 2:
+                plain = dtrunc(plain, inner - 2)
                 styled = f"{fg(c['file'])}{plain}{RESET}"
-            gap = max(0, inner - 2 - len(plain))
+            gap = max(0, inner - 2 - dwidth(plain))
             row = f" {styled}{' ' * gap} "
             if cursor is not None and idx == cursor:
                 row = f"{bg(c['selected_bg'])}{row}{RESET}"
@@ -1669,7 +2319,7 @@ class Navigateur:
             "↓" if self.panel_top + body_h < len(body) else "")
         if arrows:
             footer += f" · {arrows} more"
-        lines.append(f"  {fg(c['dim'])}{footer[:max(0, cols - 3)]}{RESET}")
+        lines.append(f"  {fg(c['dim'])}{dtrunc(footer, max(0, cols - 3), '')}{RESET}")
 
         while len(lines) < height:
             lines.append("")
@@ -1826,14 +2476,19 @@ class Navigateur:
             self.panel_edit = "color"
             self.edit_buf = "#"
 
-    def _panel_key(self, key: str) -> bool:
+    def _panel_key(self, key: str, screen: Screen) -> bool:
         """One keypress while a panel is up. Returns True only for the keys
         that quit the browser outright.
 
         `q` still quits from in here, and `esc` is what closes a panel. That
         is the documented invariant kept deliberately rather than adopting the
         pager convention: `q` is the one key in this file with no second
-        meaning anywhere, and ESC already carries the context-sensitive one."""
+        meaning anywhere, and ESC already carries the context-sensitive one.
+
+        `screen` is here for the reader alone: `e` hands the real terminal to a
+        foreground editor, which needs suspend()/resume(). There is exactly one
+        call site, in run(), so threading it is cheaper than the alternative of
+        handling one panel's key outside the panel handler."""
         if key in ("\x03", "\x04"):
             return True
 
@@ -1866,14 +2521,28 @@ class Navigateur:
 
         if key == "ESC":
             # One level at a time: a submenu falls back to the settings menu,
-            # the settings menu (and the keys table) back to the tree.
+            # the settings menu (and the keys table) back to the tree. The
+            # reader is in neither set, so it closes straight to the tree --
+            # and drops its history with it, which is what makes reopening a
+            # file a fresh read rather than a resumed session.
+            if self.mode == "reader":
+                self.close_reader()
+                return False
             self.mode = "settings" if self.mode in self.SUBMENUS else None
             self.panel_top = self.panel_cursor = 0
             return False
 
-        body, _footer = self._panel_content()
+        body, _footer = self._panel_content(self.panel_w)
         last = max(0, len(body) - 1)
         action = self.binds.get(key)
+        if self.mode == "reader":
+            # Above the shared block on purpose. A document scrolls freely
+            # rather than moving a cursor, `h` means "back" rather than
+            # "leave", and ↵ follows a link rather than opening a row -- none
+            # of which the generic branches below can express.
+            self._reader_key(key, screen, last)
+            self.panel_top = max(0, min(self.panel_top, last))
+            return False
         if self.mode == "bookmarks" and key in "0123456789":
             # The same `b`+digit idiom, reused where the slots are on screen --
             # and the concrete reason this handler has to sit above run()'s
@@ -1904,6 +2573,223 @@ class Navigateur:
             self.mode = None if self.mode == want else want
             self.panel_top = self.panel_cursor = 0
         return False
+
+    # -- the reader -------------------------------------------------------
+    #
+    # `↵` on a .md opens the file here rather than handing it to another
+    # application: a reader that stays inside frame() is the only one that can
+    # follow a link with the keyboard and come straight back. The vault this
+    # was written for uses plain relative markdown links -- [x](notions/y.md),
+    # not [[wikilinks]] -- so following one is path resolution against the
+    # containing file and needs no index and no external tool.
+
+    def _reader_styles(self) -> dict[str, str]:
+        c = self.colors
+        return {
+            "frame": fg(c["dim"]), "text": fg(c["file"]), "dim": fg(c["dim"]),
+            "code": fg(c["dir"]), "bold": fg(c["file"]) + BOLD,
+            "em": fg(c["dim"]), "quote": fg(c["dim"]),
+            "rule": fg(c["border"]), "head": fg(c["accent"]) + BOLD,
+            "link": fg(c["dir"]),
+            "linksel": fg(c["accent"]) + BOLD,
+        }
+
+    def _reader_body(self, width: int) -> list[tuple[str, str]]:
+        """Re-wrapped every paint, which is what makes a resize just work. The
+        maps it stashes are how a link id and an anchor -- both
+        width-independent -- get turned into a line number, which is not."""
+        doc = self.reader
+        if doc is None:
+            return [("", "")]
+        sel = doc.link if doc.links else None
+        lines, self._reader_map, self._reader_blockmap = md_render(
+            doc.blocks, width, self._reader_styles(), sel)
+        return lines or [("", "")]
+
+    def _reader_footer(self) -> str:
+        doc = self.reader
+        if doc is None:
+            return "esc back"
+        if not doc.links:
+            return "j/k scroll · e edit · esc back"
+        return (f"link {doc.link + 1}/{len(doc.links)} · tab next · ↵ follow"
+                f" · ⌫ back · esc close")
+
+    def _reader_target(self) -> int | None:
+        """The line the next paint has to bring into view: a pending anchor
+        first (it was just jumped to), otherwise the selected link.
+
+        The anchor is resolved and consumed HERE, in the renderer, because it
+        is the only place that knows the width -- md_render's blockmap does not
+        exist until the page has been wrapped."""
+        doc = self.reader
+        if doc is None:
+            return None
+        if self.reader_seek is not None:
+            line = md_anchor_line(doc.blocks, self._reader_blockmap,
+                                  self.reader_seek)
+            self.reader_seek = None
+            if line is None:
+                self.message = self.message or "no such heading"
+            else:
+                self.panel_top = line  # a jump lands the heading at the top
+                return line
+        return self._reader_map.get(doc.link) if doc.links else None
+
+    def open_reader(self, path: Path, anchor: str | None = None) -> bool:
+        """Read, parse and show. False (with a message set, and the tree still
+        under you) for anything that will not open: `↵` must never be the key
+        that raises out of the browser, and a link to a file that has been
+        deleted must not cost you the document you were reading."""
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            self.message = f"cannot read {path.name}: {exc.strerror or exc}"
+            return False
+        blocks, links = md_parse(text)
+        self.reader = MDDoc(path, blocks, links)
+        self.reader_seek = anchor
+        self._reader_map, self._reader_blockmap = {}, {}
+        self.mode = "reader"
+        self.panel_top = 0
+        return True
+
+    def close_reader(self) -> None:
+        self.reader = None
+        self.reader_stack.clear()
+        self.reader_seek = None
+        self.mode = None
+        self.panel_top = self.panel_cursor = 0
+
+    def reader_back(self) -> None:
+        """One step of history. Restores the scroll AND the link, not just the
+        file: coming back to a 1200-line index at line 0 with link 0 selected
+        loses exactly the place the user was keeping."""
+        if not self.reader_stack:
+            self.message = "no page to go back to"
+            return
+        path, top, link = self.reader_stack.pop()
+        if not self.open_reader(path):
+            return
+        self.panel_top = top
+        if self.reader.links:
+            self.reader.link = min(link, len(self.reader.links) - 1)
+        # The link is already on screen -- do not let _reader_target() scroll
+        # the restored position away from under it.
+        self.reader_seek = None
+
+    def reader_link_move(self, step: int) -> None:
+        doc = self.reader
+        if doc is None or not doc.links:
+            self.message = "no links in this file"
+            return
+        doc.link = (doc.link + step) % len(doc.links)
+
+    def follow_link(self, screen: Screen) -> None:
+        """↵ on a selected link. Everything is resolved against the CONTAINING
+        file's directory, which is what makes notions/INDEX.md's own relative
+        links work once you have followed one."""
+        doc = self.reader
+        if doc is None or not doc.links:
+            self.message = "no links in this file"
+            return
+        label, target = doc.links[doc.link]
+        if target.startswith(("http://", "https://", "mailto:")):
+            self._open_external(target)
+            return
+        raw, _, anchor = target.partition("#")
+        if not raw:
+            # A same-file anchor -- 367 of them in this vault. Deliberately NOT
+            # a history push: it is a scroll, not a document change, and a back
+            # stack full of scroll positions makes ⌫ useless.
+            self.reader_seek = anchor
+            return
+        try:
+            dest = (doc.path.parent / unquote(raw)).resolve()
+        except (OSError, ValueError):
+            self.message = f"bad link target: {target}"
+            return
+        if dest.is_dir():
+            # A link to a folder is a browsing job, not a reading one.
+            self.close_reader()
+            self.reveal_path(dest)
+            self.maybe_publish()
+            self.message = f"went to {dest.name}"
+            return
+        if not dest.exists():
+            self.message = f"missing: {home_short(dest)}"
+            return
+        if dest.suffix.lower() in MD_SUFFIXES:
+            here = (doc.path, self.panel_top, doc.link)
+            if self.open_reader(dest, anchor or None):
+                self.reader_stack.append(here)
+            return
+        if dest.suffix.lower() in EDIT_SUFFIXES or dest.name in EDIT_NAMES:
+            self._run_editor(screen, dest)
+            screen.prev = []  # the editor owned the screen; repaint whole
+            return
+        self._open_external(str(dest))
+
+    def _open_external(self, target: str) -> None:
+        """A URL or a non-text file from inside a document. open_it()'s rules,
+        but for an arbitrary target rather than the highlighted row -- and, as
+        there, every unsupported case is a message rather than an exception."""
+        if IS_MAC:
+            args = ["open", target]
+        else:
+            if not has_display():
+                self.message = "no display -- cannot open that link here"
+                return
+            if not shutil.which("xdg-open"):
+                self.message = "xdg-open not found"
+                return
+            args = ["xdg-open", target]
+        try:
+            subprocess.run(args, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, check=False)
+            self.message = f"opened {dtrunc(target, 48)}"
+        except OSError as exc:
+            self.message = f"open failed: {exc}"
+
+    def _reader_key(self, key: str, screen: Screen, body_len: int) -> None:
+        """The reader's keys, handled before the shared panel navigation so
+        that `h`, `b` and the digits mean what they mean in a document rather
+        than what they mean in the tree.
+
+        `q` and `esc` are not here: _panel_key() has already dealt with both,
+        keeping "q always quits, esc closes the panel" true in the one mode
+        most likely to tempt someone into the pager convention."""
+        action = self.binds.get(key)
+        page = max(1, self.panel_h - 1)  # one line of overlap, as pagers do
+        if key == "\t":
+            self.reader_link_move(1)
+        elif key == "BACKTAB":
+            self.reader_link_move(-1)
+        elif key == "ENTER":
+            self.follow_link(screen)
+        elif key in ("\x7f", "\x08") or action == "leave" or key == "LEFT":
+            self.reader_back()
+        elif action == "edit":
+            if self.reader is not None:
+                self._run_editor(screen, self.reader.path)
+                screen.prev = []
+                self.open_reader(self.reader.path)  # it may have been edited
+        elif action == "down":
+            self.panel_top += 1
+        elif action == "up":
+            self.panel_top = max(0, self.panel_top - 1)
+        elif action == "top":
+            self.panel_top = 0
+        elif action == "bottom":
+            self.panel_top = max(0, body_len - 1)
+        elif key in (" ", "\x06"):  # space and ctrl-f page forward
+            self.panel_top += page
+        elif key in ("b", "\x02"):
+            self.panel_top = max(0, self.panel_top - page)
+        elif key == "n":
+            self.reader_link_move(1)
+        elif key == "p":
+            self.reader_link_move(-1)
 
     def render_row(self, idx: int, inner: int, border: str) -> str:
         c = self.colors
@@ -1959,7 +2845,7 @@ class Navigateur:
             if self.mode:
                 # Above the count buffer on purpose: that block eats every
                 # digit, and the bookmarks panel selects rows by digit.
-                if self._panel_key(key):
+                if self._panel_key(key, screen):
                     return  # only q / ctrl-c / ctrl-d get here
                 continue
 
@@ -1982,9 +2868,9 @@ class Navigateur:
                 return
             elif key == "ESC":
                 # Esc backs out of move/copy/cut mode without touching the
-                # marked files -- same as pressing the verb key with nothing
-                # marked, just reachable without emptying the marks first.
-                # Outside a pending op it's still an alias for q.
+                # marked files -- same as pressing Enter with nothing marked,
+                # just reachable without emptying the marks first. Outside a
+                # pending op it's still an alias for q.
                 if self.pending_op:
                     verb = self.pending_op
                     self.marked.clear()
@@ -1993,8 +2879,36 @@ class Navigateur:
                 else:
                     return
             elif key == "ENTER":
-                self.chosen = self.published_dir()
-                return
+                # Context-sensitive like Esc above: confirms a pending
+                # move/copy/cut/delete (the verb key itself only enters/
+                # refreshes the mode now, see the op_* dispatch below) and
+                # falls through to maybe_publish() instead of returning.
+                # With no pending op it opens the highlighted file, or --
+                # on a folder -- is the plain "cd here and quit". A .md
+                # opens the reader, which is a *mode*: the browser keeps
+                # running behind it, so this branch must not return either.
+                if self.pending_op:
+                    verb = self.pending_op
+                    if not self.marked:
+                        self.pending_op = None
+                        self.message = f"{verb} cancelled -- nothing marked"
+                    elif verb == "delete":
+                        self.try_delete(screen, cols, height)
+                    else:
+                        self.try_op(screen, cols, height)
+                else:
+                    # root_selected is load-bearing here, not defensive:
+                    # after a reveal_path() teleport published_dir() ignores
+                    # the row on purpose, so `↵` must stay "cd to the root"
+                    # even when row 0 happens to be a file. Opening a file
+                    # falls through to maybe_publish() rather than returning,
+                    # exactly as the pending_op branch above does.
+                    row = self.current()
+                    if not self.root_selected and row is not None and not row.is_dir:
+                        self.open_file(row, screen)
+                    else:
+                        self.chosen = self.published_dir()
+                        return
             elif action == "down":
                 self.move(count)
             elif action == "up":
@@ -2003,10 +2917,14 @@ class Navigateur:
                 self.enter()
             elif action == "leave":
                 self.leave()
+            elif action == "collapse_all":
+                self.collapse_all()
             elif action == "top":
                 self.cursor = 0
+                self.root_selected = False
             elif action == "bottom":
                 self.cursor = max(0, len(self.rows) - 1)
+                self.root_selected = False
             elif action == "open":
                 self.open_it()
             elif action == "reveal":
@@ -2075,23 +2993,18 @@ class Navigateur:
                         self.reveal_path(target)
                         self.message = f"went to bookmark {slot}"
             elif action in ("op_move", "op_copy", "op_cut", "op_delete"):
+                # Entering fresh, switching verb mid-mark, or re-pressing the
+                # same verb key -- all three just (re-)enter the mode and
+                # refresh the hint now. The marks (if any) carry over
+                # unchanged either way; confirming is Enter's job, not a
+                # second press of this key (see the ENTER branch above).
                 verb = action[3:]
-                if self.pending_op != verb:
-                    # Entering fresh, or switching verb mid-mark -- either way
-                    # the current marks (if any) carry over unchanged.
-                    self.pending_op = verb
-                    n = len(self.marked)
-                    mark = self.keys["mark"]
-                    where = "" if verb == "delete" else " here"
-                    self.message = (f"{n} marked -- {key} to {verb}{where}" if n
-                                     else f"{verb} mode -- {mark} to mark, {key} to {verb}{where}")
-                elif not self.marked:
-                    self.pending_op = None
-                    self.message = f"{verb} cancelled -- nothing marked"
-                elif verb == "delete":
-                    self.try_delete(screen, cols, height)
-                else:
-                    self.try_op(screen, cols, height)
+                self.pending_op = verb
+                n = len(self.marked)
+                mark = self.keys["mark"]
+                where = "" if verb == "delete" else " here"
+                self.message = (f"{n} marked -- ↵ to {verb}{where}" if n
+                                 else f"{verb} mode -- {mark} to mark, ↵ to {verb}{where}")
             elif action == "new_file":
                 name = self.read_line(screen, cols, height, "new file: ")
                 if name in ("\x03", "\x04"):

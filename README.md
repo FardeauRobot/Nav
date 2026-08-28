@@ -25,15 +25,72 @@ including over ssh.
 ### 1. Browse your files and land there
 
 Type `navigate` in any terminal. Move with `j`/`k`, open a folder with `l`,
-back out with `h`. Press `↵` and the browser quits **and your shell is now in
-that directory**. Press `q` instead and your shell stays where it was.
+back out with `h`. Press `↵` **on a folder** and the browser quits **and your
+shell is now in that directory**. Press `q` instead and your shell stays where
+it was. Press `↵` **on a file** and it opens instead — see below — and the
+browser stays open behind it.
+
+Because `↵` on a file now opens it, cd-ing to the folder a file *lives in* means
+highlighting that folder, or pressing `h` first.
 
 That is the core of it: a visual `cd`. Give it a starting point with
 `navigate ~/projects`, and jump around with bookmarks — `B` then a digit to
 save the folder you're on, `b` then that digit to come back, from any window.
 (On a file, `B` saves its folder — the same rule `↵` uses.)
 
-### 2. Hand a file or folder to the rest of your desktop
+### 2. Opening a file with `↵`
+
+`↵` on a **folder** is the visual `cd` above. `↵` on a **file** opens it and
+leaves the browser running, routing on the file's extension:
+
+| the file | what happens |
+| --- | --- |
+| `.md`, `.markdown`, `.mdown` | the **reader**, right there in the browser — see below |
+| any source or config file — `.c` `.h` `.cpp` `.py` `.rs` `.go` `.js` `.ts` `.sh` `.zsh` `.toml` `.json` `.yaml` `.txt` and friends, plus `Makefile`, `Dockerfile`, `.zshrc`, `.gitignore`… | your editor, in this terminal — the same handoff `E` uses |
+| anything else — a `.png`, a `.pdf`, a binary | your desktop's default app, exactly as `o` does |
+
+The editor is `$VISUAL`, then `$EDITOR`, then `nvim`, then `vim`. A value with
+arguments (`code -w`) works; a GUI editor that returns immediately will just
+flicker the screen, so give it its wait flag.
+
+### 3. Reading markdown, and following its links
+
+`↵` on a `.md` opens it **inside the browser**. Headings, bold, `code`, lists,
+task lists, block quotes, tables and fenced code blocks are rendered; YAML
+frontmatter is skipped; the page re-wraps when you resize the window.
+
+Links are the point. `Tab` walks them, `↵` follows the one you're on:
+
+| key | in the reader |
+|---|---|
+| `j` / `k`, `↓` / `↑` | scroll a line |
+| `Space` / `b` | page down / up |
+| `g` / `G` | top / bottom |
+| `Tab` / `Shift-Tab` (or `n` / `p`) | next / previous link |
+| `↵` | follow the selected link |
+| `⌫` (or `h` / `←`) | back to the page you came from, at the line and the link you left |
+| `E` | edit this file in your editor, then re-read it |
+| `Esc` | close the reader |
+| `q` | quit the browser, as everywhere else |
+
+A link is resolved **relative to the file it is written in**, so
+`[notions/](notions/INDEX.md)` in `cpp/INDEX.md` goes exactly where it would in
+any markdown tool. What happens next depends on what it points at:
+
+| the target | what happens |
+|---|---|
+| another `.md` | opens in the reader; `⌫` comes back |
+| `#a heading` in this file | scrolls there — it isn't a new page, so it doesn't join the back history |
+| `other.md#a heading` | opens that file, scrolled to that heading |
+| a folder | closes the reader and jumps the tree there |
+| a source or config file | your editor, then back to the document |
+| `http://…`, `https://…` | your browser, via the desktop |
+| something that isn't there any more | says so, and leaves you on the page you were reading |
+
+There is no vault, no index and no external tool: a `.md` anywhere on disk
+reads the same way, this project's own `README.md` included.
+
+### 4. Hand a file or folder to the rest of your desktop
 
 Four keys reach outside the terminal, using whatever is under the cursor:
 
@@ -46,7 +103,7 @@ For `w` and `t`, "this folder" means the nearest enclosing directory — on a
 file you get its folder, not an error. Which terminals this works with is the
 one genuinely uneven part of the tool; see [Limitations](#limitations).
 
-### 3. Make your other terminals follow this one
+### 5. Make your other terminals follow this one
 
 One window **leads**, the others **follow** its current directory:
 
@@ -136,26 +193,27 @@ what the `source` line in your `.zshrc` is for.
 | `j` / `k` | down / up (`↓` `↑` too) |
 | `l` | expand the folder (`→` too) |
 | `h` | collapse it — or jump to the parent — or, at the top, re-root one level up (`..`) (`←` too) |
+| `=` | collapse every expanded folder, back to the root listing |
 | `g` / `G` | top / bottom |
 | `.` | show/hide dotfiles |
 | `o` | open with the default app; a folder opens in the file manager |
 | `O` | reveal in the file manager (parent folder, file selected) |
-| `E` | edit the highlighted file or folder in `nvim`, taking over the terminal |
+| `E` | edit the highlighted file or folder in `$VISUAL`/`$EDITOR` (else `nvim`, else `vim`), taking over the terminal |
 | `w` | open this folder in a new terminal **window** |
 | `t` | open this folder in a new terminal **tab** |
 | `B` then `0`-`9` | bookmark the folder you're on under that digit |
 | `b` then `0`-`9` | go to that bookmark |
 | `n` | create a new empty file here, after typing a name |
-| `m` | enter **move mode**; `m` again moves everything marked to here (asks `y` to confirm) |
-| `c` | enter **copy mode**; `c` again copies everything marked to here (asks `y` to confirm) |
-| `x` | enter **cut mode**; `x` again relocates everything marked to here (asks `y` to confirm) -- the same operation as move, under its own key |
-| `d` | enter **delete mode**; `d` again deletes everything marked, asking `y`/`Y` per item |
+| `m` | enter **move mode**; then `↵` moves everything marked to here (asks `y` to confirm) |
+| `c` | enter **copy mode**; then `↵` copies everything marked to here (asks `y` to confirm) |
+| `x` | enter **cut mode**; then `↵` relocates everything marked to here (asks `y` to confirm) -- the same operation as move, under its own key |
+| `d` | enter **delete mode**; then `↵` deletes everything marked, asking `y`/`Y` per item |
 | `e` | mark/unmark the current row, while in move, copy, cut or delete mode |
 | `F` | **lead** this window's group — its followers track this window |
 | `f` | **follow** this window's group — refused if nobody is leading it |
 | `?` | the full key table, laid out and grouped |
 | `,` | settings: your colours, your keys, your bookmarks |
-| `↵` | quit **and** cd your shell here |
+| `↵` | **on a folder**: quit and cd your shell here. **On a `.md`**: read it in the browser (see *Reading markdown*). **On any other file**: open it (see *Opening a file with `↵`*), staying in the browser. With a move/copy/cut/delete pending, confirm it instead |
 | `q` or `Esc` | quit, leaving your shell where it was — `Esc` instead cancels move/copy/cut/delete mode if one is pending, or closes a panel, without quitting |
 | `Ctrl-C` / `Ctrl-D` | quit, same as `q` |
 
@@ -175,6 +233,9 @@ bindings rather than the defaults. `,` opens a small menu:
 | keybinds | every rebindable action and the key it's on — `↵`, then press a key |
 | bookmarks | all ten slots, where each points, and which ones are dead |
 
+The reader (above) is a panel too, which is why `Esc` closes it and `q` still
+quits from inside it.
+
 Inside a panel: `j`/`k` move, `↵` opens the row (in **bookmarks**, `↵` goes
 there and closes the panel), `Esc` backs out one level — submenu → menu →
 browser. **`q` still quits the browser outright, from inside a panel as
@@ -185,17 +246,16 @@ take no argument, so they act on the group the window is already in — they
 never yank you back to `default`.
 
 At the `B`/`b` digit prompt, any key that isn't a digit cancels (`Ctrl-C` and
-`Ctrl-D` still quit). The move, copy and cut confirm prompts (the second `m`,
-`c` or `x`) work the same way: anything other than `y` cancels the whole
-operation and clears your marks (`Ctrl-C`/`Ctrl-D` still quit). You can
-navigate freely between marks — expand, collapse, jump around — nothing
-happens until that second `m`/`c`/`x` and the `y` that follows it. A
-destination that's inside a folder you've marked, or that already has
-something by the same name, is refused with your marks intact, so you can
-just pick a different destination.
+`Ctrl-D` still quit). The move, copy and cut confirm prompts (triggered by
+`↵`) work the same way: anything other than `y` cancels the whole operation
+and clears your marks (`Ctrl-C`/`Ctrl-D` still quit). You can navigate freely
+between marks — expand, collapse, jump around — nothing happens until you
+press `↵` and then `y`. A destination that's inside a folder you've marked,
+or that already has something by the same name, is refused with your marks
+intact, so you can just pick a different destination.
 
 Delete (`d`) confirms differently, since there's no destination to protect:
-the second `d` asks `y`/`N` once **per marked item**, not once for the whole
+pressing `↵` asks `y`/`N` once **per marked item**, not once for the whole
 batch — deleting a file you didn't mean to is worse than a stray move, so
 each one gets its own chance to say no. Press `Y` instead of `y` on any item
 to delete it and everything still left in the batch without asking again, for
@@ -205,14 +265,14 @@ cancels the rest of the batch, same rule as move/copy/cut.
 Marks are shared across move, copy, cut and delete: pressing a different
 verb's key while you already have marks switches the mode without losing
 them, so you can mark a batch, glance at `m`'s hint, then decide you actually
-wanted `c`, `x` or `d` instead — whichever verb key you press second is what
-runs. Cut and move do the same thing to your files (relocate rather than
+wanted `c`, `x` or `d` instead — whichever verb key you pressed last is what
+`↵` runs. Cut and move do the same thing to your files (relocate rather than
 duplicate); `x` exists as its own key/label for people who think in
 cut-and-paste terms, not because it behaves differently from `m`.
 
 `Esc` also gets you out of move/copy/cut/delete mode at any point before the
 confirm prompt, dropping your marks without touching anything — a quicker way
-out than pressing the verb key again with nothing marked.
+out than pressing `↵` with nothing marked.
 
 Unbound keys do nothing — **except escape sequences**: only the four arrows are
 decoded, so PageUp, Home, End, the function keys and modified arrows all arrive
