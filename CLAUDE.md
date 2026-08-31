@@ -201,11 +201,14 @@ cursor and must not silently change what `↵` will confirm.
 
 ## Opening a file with `↵`
 
-`↵` is now three-way: a pending op confirms, a **file** opens via `open_file()`, a **folder**
-does the old `self.chosen = self.published_dir(); return`. `open_file()` routes on
-`row.path.suffix.lower()` against `MD_SUFFIXES` / `EDIT_SUFFIXES` / `EDIT_NAMES` (module
-level, next to `LINUX_TERMINALS`) and falls through to `open_it()` for everything else — so
-the desktop handoff stays the single default rather than being reimplemented.
+`↵` is two-way: a **file** opens via `open_file()`, a **folder** does the old
+`self.chosen = self.published_dir(); return`. (It used to be three-way — a pending
+move/copy/cut/delete confirmed here too — but the verb keys `m`/`c`/`x`/`d` now run their
+own confirm the moment they are pressed, so there is nothing left for `↵` to confirm; see
+"Move/copy/cut/delete".) `open_file()` routes on `row.path.suffix.lower()` against
+`MD_SUFFIXES` / `EDIT_SUFFIXES` / `EDIT_NAMES` (module level, next to `LINUX_TERMINALS`) and
+falls through to `open_it()` for everything else — so the desktop handoff stays the single
+default rather than being reimplemented.
 
 - **The `root_selected` gate is the whole subtlety.** `published_dir()` deliberately ignores
   the row in the window after a `reveal_path()` teleport, because `self.root` is structurally
@@ -213,16 +216,24 @@ the desktop handoff stays the single default rather than being reimplemented.
   the first `↵` after every bookmark jump and open whatever file `list_dir()`'s sort put on
   row 0 — the exact class of bug `root_selected` was added to fix. The branch is
   `not self.root_selected and row is not None and not row.is_dir`.
-- **Opening a file falls through, never `return`s** — same reason the `pending_op` confirm
-  does: the message has to reach the next paint.
+- **Opening a file falls through, never `return`s** — the message has to reach the next
+  paint, the same reason `try_op()`/`try_delete()` do after a confirm.
 - **`editor_argv()` is the one editor resolver**, shared by `E` (`edit_it()`) and by `↵`
   (`_run_editor()`), for the same reason `key_ok()` and `group_ok()` are single: two copies
   would drift. `$VISUAL` → `$EDITOR` → `nvim` → `vim`, `shlex.split` so `code -w` survives.
   `edit_it()` used to hardcode `"nvim"`; the fallback chain makes that a no-op wherever
   neither variable is set.
+- **`_run_editor()` takes `list[Path]` and has four call sites** — `edit_it()` (`E`),
+  `open_file()` (`↵` on a source file), `follow_link()` (a link in the reader) and the
+  reader's own `E`. Only `E` ever passes more than one path: `_edit_targets()` returns the
+  marked set (sorted strings — never a walk of `self.rows`, which would drop a mark in a
+  collapsed subtree) or the highlighted row. More than one path gets `-o` **only** when
+  `Path(argv[0]).name` is `nvim`/`vim` — `-o` is a vim split flag and a filename to anything
+  else. `select_path()` runs only for the single-path case; a multi-open leaves the cursor
+  put. `E` does **not** clear the marks — they are a pending copy/move batch it is only
+  previewing.
 - **`_run_editor()` uses `Screen.suspend()`/`resume()`, never `restore()`** — see that
-  section under Cross-file invariants. It is the same loan `E` always took, now taken from
-  two call sites.
+  section under Cross-file invariants. It is the same loan `E` always took.
 - **`MD_SUFFIXES` means "the reader", unconditionally.** An earlier pass routed markdown to
   `open -a Warp` behind a `_warp_can_render()` gate, on the belief that Warp's Markdown
   Viewer would render it — inferred from the bundle's `CFBundleDocumentTypes` registration
@@ -316,12 +327,12 @@ about, and a row in the table with no matching branch is a lie printed on screen
 cheapest check is set equality between the two — `set(DEFAULT_KEYS)` against the actions
 `run()` actually branches on — which is worth re-running by hand after touching either.
 
-There is no `VERB_KEYS` any more: the confirm step for a pending move/copy/cut/delete is
-the fixed `↵`, which `RESERVED_KEYS` keeps out of reach of rebinding, so there is no live
-keymap to derive it from and no "hint advertises a stale rebound letter" hazard to guard
-against — `_hint_line()` and `toggle_mark()` just spell `↵` literally. `self.keys["mark"]`
-is a different case: `e` **can** be rebound, so `_hint_line()` and the move/copy/cut
-messages still read it live rather than spelling `e`.
+There is no `VERB_KEYS` any more, and no confirm step keyed off `↵`: the verb key
+(`op_move`/`op_copy`/`op_cut`/`op_delete`) *is* the trigger now — it calls
+`try_op()`/`try_delete()` the instant it is pressed, on whatever `self.marked` holds. Every
+place that names a verb key to the user — `_hint_line()`'s `self.marked` branch,
+`toggle_mark()`'s message, `try_op()`'s confirm prompt — reads it live from `self.keys`,
+because `m`/`c`/`x`/`d` and `e` can all be rebound. Nothing spells them as literals.
 
 - **Rows with `action = None` are the fixed keys** — `↵`, `esc`, `q`, `^c`/`^d`. They are
   displayed but never rebindable, and `RESERVED_KEYS` refuses them (plus the digits, which
@@ -468,8 +479,8 @@ Each of these looks like removable noise and is load-bearing:
   armed the whole time — a `SIGWINCH` firing mid-edit just blanks `prev`, harmless with nothing
   painting. `resume()`'s `termios.tcflush(TCIFLUSH)` is load-bearing, not cosmetic: without it,
   a keystroke queued during `nvim`'s own exit sequence is still sitting in the tty buffer when
-  `key()` next reads, and decodes as a real keypress in the browser — a stray `ESC` with no
-  `pending_op` would quit it outright.
+  `key()` next reads, and decodes as a real keypress in the browser — a stray `ESC` with
+  nothing marked would quit it outright.
 - **Both backspaces erase.** The colour prompt accepts `\x7f` **and** `\x08` — which one a
   terminal sends depends on its erase setting, and a typing prompt where the erase key
   silently does nothing is the kind of bug nobody reports and everybody hates.
@@ -481,7 +492,7 @@ Each of these looks like removable noise and is load-bearing:
 - **Colours are plain 24-bit hex, not palette slots.** That is the reason this is raw ANSI
   rather than curses. Keep it that way.
 
-## Move/copy/cut/delete mode: the first code that mutates the browsed tree
+## Move/copy/cut/delete: the first code that mutates the browsed tree
 
 Everything else `nav.py` writes is bookkeeping under `$NAV_STATE` — bookmarks, roles, group
 `cwd` files. `do_move()`/`do_copy()`/`try_delete()` are the only places the browser changes
@@ -489,39 +500,55 @@ what it is showing you, via `shutil.move()`/`shutil.copy2()`/`shutil.copytree()`
 `shutil.rmtree()`/`Path.unlink()`, and the invariants below exist because a mistake here loses
 a user's files rather than corrupting a scratch file that a restart repairs.
 
-`self.pending_op` is `None | "move" | "copy" | "cut" | "delete"` — one state machine, not
-four. `m`, `c`, `x` and `d` all funnel into the same `toggle_mark()` path; `marked`/
-`pending_op` themselves don't distinguish delete from the other three. Only two things read
-`pending_op`'s specific value: the confirm-prompt wording (`toggle_mark()`, `_hint_line()`,
-the `op_*` dispatch in `run()` — all three use the same `where = "" if verb == "delete"
-else " here"` substitution rather than duplicating the message-building code) and, in
-`run()`'s `ENTER` branch, which confirm method runs (`try_delete()` for delete, `try_op()`
-otherwise) — the `op_*` keys (`m`/`c`/`x`/`d`) themselves only ever enter or refresh the
-mode now; they no longer trigger the confirm on a repeated press. **Delete does not share
-`_op_batch()`/`try_op()`** —
-it has its own `_delete_batch()` (nested-mark collapse only, no destination to check for
-collisions or nesting-into-itself) and `try_delete()` (see below), because there is no
-destination for a delete to collide with or land in. **Cut is move**, not a third filesystem
-operation: `try_op()` routes both `"move"` and `"cut"` to `do_move()`, and `do_move()` takes a
-`verb` parameter used *only* to spell "moved" vs "cut" in the outcome message. There is
-deliberately no `do_cut()`. This was an explicit user choice — the first ask was answered by
-pointing out `m` already does what "cut" means (relocate, not duplicate), and the user later
-asked for `x` as a real key anyway, for people who think in cut/paste terms; what they did not
-ask for, and what would be a mistake to build, is a second code path that could drift from
-move's collision/nesting guarantees.
+**`self.marked` is the only op state — a free-standing selection, not a mode.** `e`
+(`toggle_mark()`) adds or removes a path string at any time; there is no `pending_op` field
+any more. The verb comes from the key you press *after* marking: `run()`'s `op_*` dispatch
+maps `op_move`/`op_copy`/`op_cut`/`op_delete` to the string `"move"`/`"copy"`/`"cut"`/
+`"delete"` and passes it straight into `try_op(…, verb)` / `try_delete()`, which run the
+confirm immediately. `verb` lives for exactly that one keypress — nothing stores it. This is
+the inversion of the old flow (arm a mode with `m`, mark with `e`, confirm with `↵`), made
+at the user's request: mark first, then act.
 
-- **`self.marked` and `self.pending_op` are one state, not two.** `marked` is non-empty only
-  while `pending_op` is set; every exit path — a successful move/copy/cut/delete, a partial
-  failure, a destination refusal that lets the user retry, and a non-`y` cancel — clears both
-  together. Neither is ever written to disk, so quitting the browser mid-operation discards
-  marks exactly like every other in-memory field.
-- **Marks are shared across all four verbs, on purpose.** Pressing a different verb key while
-  marks already exist switches `pending_op` rather than executing anything — the user can mark
-  a batch under `m`, glance at the hint, and switch to `c`, `x` or `d` before ever confirming.
-  This falls out of the state machine for free; resist the urge to "fix" it into locking the
-  verb at entry, since that needs an extra branch and a special-case message for no behavioural
-  gain — the confirm prompt already names the verb (and, for move/copy/cut, the destination),
-  so a fat-fingered switch is visible before anything happens.
+- **The verb key is the trigger, and there is no `↵` confirm any more.** `try_op()` /
+  `try_delete()` still run their own `y` / per-item prompt via `read_slot()`; what changed is
+  that pressing `m`/`c`/`x`/`d` *is* what reaches them. `↵` is back to two-way (open a file /
+  cd on a folder). `VERB_KEYS` is gone with the mode.
+- **Nothing marked: all four verbs refuse.** The `op_*` dispatch, with `self.marked` empty,
+  sets `"nothing marked -- {mark} marks a row"` and returns — there is no implicit "act on
+  the cursor row" batch. The plan asked for one (m/c/x on the highlighted row), but for
+  move/copy/cut the destination *is* `published_dir()`, read off that same cursor row: a
+  one-item batch taken from the cursor can only ever be `[]` ("already there", a file in its
+  own directory) or `None` ("into itself", a folder), so the fallback had two refusals and
+  no success path. `d` never had a fallback anyway — `d` then `y` on whatever the cursor
+  sits on is unrecoverable. Mark first, always.
+- **`toggle_mark()` needs no mode.** It used to refuse outside a `pending_op`; now it only
+  guards `row is None`. Marks are path strings, independent of `self.rows` (same convention
+  as `expanded`), so collapsing a marked folder never unmarks it, and a mark can live in a
+  collapsed subtree — which is why `_edit_targets()` sorts the strings rather than walking
+  `self.rows`.
+- **`self.marked` is never written to disk**, so quitting the browser mid-selection discards
+  it like every other in-memory field.
+- **Delete does not share `_op_batch()`/`try_op()`** — it has its own `_delete_batch()`
+  (nested-mark collapse only, no destination to check for collisions or nesting-into-itself)
+  and `try_delete()` (see below), because there is no destination for a delete to collide
+  with or land in.
+- **Cut is move**, not a third filesystem operation: `try_op()` routes both `"move"` and
+  `"cut"` to `do_move()`, and `do_move()` takes a `verb` parameter used *only* to spell
+  "moved" vs "cut" in the outcome message. There is deliberately no `do_cut()`. This was an
+  explicit user choice — the first ask was answered by pointing out `m` already does what
+  "cut" means (relocate, not duplicate), and the user later asked for `x` as a real key
+  anyway, for people who think in cut/paste terms; what they did not ask for, and what would
+  be a mistake to build, is a second code path that could drift from move's collision/nesting
+  guarantees.
+- **Marks outlive a cancel, and are shared across the verbs.** A non-`y` reply to
+  `try_op()`'s confirm sets `"{verb} cancelled -- marks kept"` and returns *without* clearing
+  `self.marked`, so the user can reposition the cursor or press a different verb without
+  re-marking (this is a deliberate change from the old clear-on-cancel, per the user).
+  `try_delete()` is the exception — see its bullet. The "already there" (`_op_batch` → `[]`)
+  and refusal (`_op_batch` → `None`) paths keep the marks too: every non-success exit of
+  `try_op()` now leaves `self.marked` alone, and only an actual `do_move()`/`do_copy()`
+  clears it. "Already there" in particular is the reposition case — you are standing in the
+  wrong directory — so dropping the marks there was the wrong move.
 - **Delete confirms per item, not once for the whole batch.** `try_delete()` loops the batch
   and calls `read_slot()` again for each item: `y` deletes this one and advances, `Y` deletes
   this one and every item still left without asking again, anything else stops the rest of the
@@ -530,7 +557,11 @@ move's collision/nesting guarantees.
   This is a deliberate divergence from move/copy/cut's single whole-batch prompt, per an
   explicit user request: a mis-click during a large delete is worse than during a move (nothing
   survives to go clean up), so it should cost one keystroke to catch, not zero — while `Y`
-  keeps a genuinely large, deliberate batch from being one keypress per file. `_delete_batch()`
+  keeps a genuinely large, deliberate batch from being one keypress per file. **`try_delete()`
+  clears `self.marked` on *every* exit path** — completion, `OSError`, ctrl-c, a non-`y`
+  reply — deliberately unlike `try_op()`, which keeps the marks on a cancel: by the time
+  `try_delete()` returns it has already touched the disk, so a surviving mark could point at
+  a path that no longer exists. `_delete_batch()`
   is `_op_batch()`'s nested-mark-collapse step alone, deliberately not a call to `_op_batch()`
   with a fake destination, since delete has no destination and none of `_op_batch()`'s
   collision/lexists checks apply. Symlink handling: `p.is_dir() and not p.is_symlink()` routes
@@ -571,8 +602,8 @@ move's collision/nesting guarantees.
   it is a deliberate flag flip here, not a bug to rediscover.
 - **A destination inside a marked folder is refused, not attempted.** Moving/copying/cutting a
   folder into its own descendant is checked with `Path.is_relative_to` before anything happens,
-  and the refusal keeps `marked`/`pending_op` intact so the user can just pick a different
-  destination instead of re-marking everything.
+  and the refusal (`_op_batch` → `None`) keeps `self.marked` intact so the user can just pick a
+  different destination instead of re-marking everything.
 - **The confirm prompt's `self.message` bypasses `_hint_line()`'s segment-dropping truncation** —
   that logic only applies to the default hint list, so a raw message is just sliced
   `hint[:cols-3]`. The prompt therefore elides the destination path from the **left**
@@ -581,28 +612,22 @@ move's collision/nesting guarantees.
   of a narrow terminal — right-truncating a safety confirmation is the one truncation bug in
   this file that would actually be dangerous.
 - **`q` and `ESC` are no longer the same branch in `run()`.** They were merged
-  (`key in ("q", "ESC")`) before move/copy/cut mode existed, since both just quit. Now `ESC`
-  is context-sensitive: with a `pending_op` set it cancels the mode (clears `marked` and
-  `pending_op`, same "`{verb} cancelled`" message `try_op()` uses for a non-`y` confirm reply)
-  and falls through to the next loop iteration instead of returning; with no `pending_op` it
-  still `return`s exactly like `q`. `q` itself keeps its own unconditional branch — it must
-  always quit, pending op or not, since it's the one key with no double meaning anywhere else
-  in the file. Don't refold these back into one `elif`; that's exactly the merge that made `ESC`
-  unable to mean anything but quit.
-- **`ENTER` is context-sensitive the same way, and for the same reason.** With a `pending_op`
-  set it confirms instead of quitting: nothing marked cancels the mode (same message the old
-  verb-key-repeat-with-no-marks path used to produce), otherwise it calls `try_delete()` or
-  `try_op()` and falls through to `maybe_publish()` — never `return`s while a confirm just
-  happened, since the batch/message needs to reach the next paint. With no `pending_op` it
-  splits again on the row: a file goes to `open_file()` (and falls through for the same
-  reason), while a folder — or a `root_selected` teleport, see "Opening a file with `↵`"
-  below — keeps the old unconditional `self.chosen = self.published_dir(); return`. This is *why* the
-  `op_move`/`op_copy`/`op_cut`/`op_delete` dispatch no longer branches on `self.pending_op`'s
-  value at all — pressing `m`/`c`/`x`/`d` again just re-enters/refreshes the mode
-  unconditionally now, since confirming moved to `ENTER` alone. `VERB_KEYS` (a property that
-  used to map verb → key so the hint could name the live confirm key) is gone along with it:
-  the confirm key is now the fixed `↵`, which `RESERVED_KEYS` keeps un-rebindable, so nothing
-  needs deriving from the keymap any more.
+  (`key in ("q", "ESC")`) before marks existed, since both just quit. Now `ESC` is
+  context-sensitive: with `self.marked` non-empty it clears the marks, sets
+  `"marks cleared"`, and falls through to the next loop iteration instead of returning; with
+  nothing marked it still `return`s exactly like `q`. So `esc` is two presses to quit out of
+  a selection — drop the marks, then quit — which the README documents as behaviour. `q`
+  itself keeps its own unconditional branch — it must always quit, marks or not, since it's
+  the one key with no double meaning anywhere else in the file. Don't refold these back into
+  one `elif`.
+- **`ENTER` is two-way, keyed on the row, not on any op state.** A file goes to
+  `open_file()` and falls through to `maybe_publish()` (the reader is a mode — the browser
+  keeps running behind it, so this branch must not `return`); a folder — or a `root_selected`
+  teleport, see "Opening a file with `↵`" above — keeps the old unconditional
+  `self.chosen = self.published_dir(); return`. There is no pending-op arm any more: the
+  verb keys run their own confirm (see the top of this section), so `↵` has nothing to
+  confirm. `VERB_KEYS` (a property that mapped verb → key so a hint could name the confirm
+  key) is gone with it.
 
 ## Scope
 
