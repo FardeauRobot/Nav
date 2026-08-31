@@ -53,6 +53,11 @@ The editor is `$VISUAL`, then `$EDITOR`, then `nvim`, then `vim`. A value with
 arguments (`code -w`) works; a GUI editor that returns immediately will just
 flicker the screen, so give it its wait flag.
 
+`E` in the tree opens every **marked** file at once (mark with `e`) — under
+`nvim`/`vim` they open in split windows (`-o`), any other editor just gets the
+file list. With nothing marked, `E` edits the highlighted row. `E` never clears
+your marks, so you can preview a batch and then still `m`/`c` it.
+
 ### 3. Reading markdown, and following its links
 
 `↵` on a `.md` opens it **inside the browser**. Headings, bold, `code`, lists,
@@ -204,17 +209,18 @@ what the `source` line in your `.zshrc` is for.
 | `B` then `0`-`9` | bookmark the folder you're on under that digit |
 | `b` then `0`-`9` | go to that bookmark |
 | `n` | create a new empty file here, after typing a name |
-| `m` | enter **move mode**; then `↵` moves everything marked to here (asks `y` to confirm) |
-| `c` | enter **copy mode**; then `↵` copies everything marked to here (asks `y` to confirm) |
-| `x` | enter **cut mode**; then `↵` relocates everything marked to here (asks `y` to confirm) -- the same operation as move, under its own key |
-| `d` | enter **delete mode**; then `↵` deletes everything marked, asking `y`/`Y` per item |
-| `e` | mark/unmark the current row, while in move, copy, cut or delete mode |
+| `r` | rename the highlighted file or folder: edit the name (←/→, Ctrl-A/E/W/U/K), then `↵`, then `y` to confirm |
+| `m` | move everything marked into the current folder (asks `y` once); does nothing if nothing is marked |
+| `c` | copy everything marked into the current folder (asks `y` once); does nothing if nothing is marked |
+| `x` | cut everything marked into the current folder — the same operation as move, under its own key; does nothing if nothing is marked |
+| `d` | delete everything marked, asking `y`/`N` per item (`Y` = all the rest); does nothing if nothing is marked |
+| `e` | mark/unmark the current row — any time, no mode |
 | `F` | **lead** this window's group — its followers track this window |
 | `f` | **follow** this window's group — refused if nobody is leading it |
 | `?` | the full key table, laid out and grouped |
 | `,` | settings: your colours, your keys, your bookmarks |
-| `↵` | **on a folder**: quit and cd your shell here. **On a `.md`**: read it in the browser (see *Reading markdown*). **On any other file**: open it (see *Opening a file with `↵`*), staying in the browser. With a move/copy/cut/delete pending, confirm it instead |
-| `q` or `Esc` | quit, leaving your shell where it was — `Esc` instead cancels move/copy/cut/delete mode if one is pending, or closes a panel, without quitting |
+| `↵` | **on a folder**: quit and cd your shell here. **On a `.md`**: read it in the browser (see *Reading markdown*). **On any other file**: open it (see *Opening a file with `↵`*), staying in the browser |
+| `q` or `Esc` | quit, leaving your shell where it was — `Esc` instead drops your marks if you have any, or closes a panel, without quitting |
 | `Ctrl-C` / `Ctrl-D` | quit, same as `q` |
 
 The line at the bottom of the window is deliberately short — five keys, not
@@ -245,34 +251,37 @@ everywhere else**; it is the one key here that never means anything else.
 take no argument, so they act on the group the window is already in — they
 never yank you back to `default`.
 
-At the `B`/`b` digit prompt, any key that isn't a digit cancels (`Ctrl-C` and
-`Ctrl-D` still quit). The move, copy and cut confirm prompts (triggered by
-`↵`) work the same way: anything other than `y` cancels the whole operation
-and clears your marks (`Ctrl-C`/`Ctrl-D` still quit). You can navigate freely
-between marks — expand, collapse, jump around — nothing happens until you
-press `↵` and then `y`. A destination that's inside a folder you've marked,
-or that already has something by the same name, is refused with your marks
-intact, so you can just pick a different destination.
+Mark first, then act. `e` marks or unmarks the current row at any time — no
+mode to enter — and you can navigate freely between marks, expanding,
+collapsing and jumping around; the marks follow the files, not the rows on
+screen. Then press the verb: `m` moves the marked set into the folder under
+the cursor, `c` copies it, `x` cuts it (same as move), `d` deletes it. Marks
+aren't tied to a verb — mark a batch, then decide whether you want `m`, `c`,
+`x` or `d`.
 
-Delete (`d`) confirms differently, since there's no destination to protect:
-pressing `↵` asks `y`/`N` once **per marked item**, not once for the whole
-batch — deleting a file you didn't mean to is worse than a stray move, so
-each one gets its own chance to say no. Press `Y` instead of `y` on any item
-to delete it and everything still left in the batch without asking again, for
-a deliberate large batch. Anything other than `y`/`Y` stops there and
-cancels the rest of the batch, same rule as move/copy/cut.
+The move, copy and cut confirm prompts name the destination and the files and
+ask `y` once for the whole batch. Anything other than `y` cancels — but
+**keeps your marks**, so you can pick a different destination or a different
+verb without re-marking (`Ctrl-C`/`Ctrl-D` still quit). A destination inside a
+folder you've marked, or one that already holds something by the same name, is
+refused the same way, marks intact. All four verbs need a mark: with nothing
+marked they just say so and do nothing — for `m`/`c`/`x` the destination is
+the row under the cursor, so a one-item batch taken from that same row could
+only ever be "already there" or "into itself".
 
-Marks are shared across move, copy, cut and delete: pressing a different
-verb's key while you already have marks switches the mode without losing
-them, so you can mark a batch, glance at `m`'s hint, then decide you actually
-wanted `c`, `x` or `d` instead — whichever verb key you pressed last is what
-`↵` runs. Cut and move do the same thing to your files (relocate rather than
-duplicate); `x` exists as its own key/label for people who think in
-cut-and-paste terms, not because it behaves differently from `m`.
+Delete confirms differently, since there's no destination to protect: `d` asks
+`y`/`N` once **per marked item**, not once for the whole batch — deleting a
+file you didn't mean to is worse than a stray move, so each one gets its own
+chance to say no. Press `Y` instead of `y` on any item to delete it and
+everything still left in the batch without asking again. Anything other than
+`y`/`Y` stops there.
 
-`Esc` also gets you out of move/copy/cut/delete mode at any point before the
-confirm prompt, dropping your marks without touching anything — a quicker way
-out than pressing `↵` with nothing marked.
+Cut and move do the same thing to your files (relocate rather than duplicate);
+`x` exists as its own key/label for people who think in cut-and-paste terms,
+not because it behaves differently from `m`.
+
+`Esc` drops your marks without touching anything, then (pressed again, with
+nothing marked) quits — the same key, two steps.
 
 Unbound keys do nothing — **except escape sequences**: only the four arrows are
 decoded, so PageUp, Home, End, the function keys and modified arrows all arrive
@@ -499,5 +508,5 @@ under `groups/`, so a window that was **already following** needs one
 
 ## Not in this first pass
 
-Fuzzy search, rename, git-status decorations, a bash integration, and
+Fuzzy search, git-status decorations, a bash integration, and
 following across machines.

@@ -170,18 +170,19 @@ KEY_SECTIONS: list[tuple[str, list[tuple[str | None, str, str, str]]]] = [
     ("opening", [
         ("open", "o", "", "open in the default app"),
         ("reveal", "O", "", "reveal in the file manager"),
-        ("edit", "E", "", "edit in your editor"),
+        ("edit", "E", "", "edit marked items, or this row, in your editor"),
         ("window", "w", "", "new terminal window here"),
         ("tab", "t", "", "new terminal tab here"),
         ("hidden", ".", "", "show or hide dotfiles"),
     ]),
     ("files", [
         ("new_file", "n", "", "new empty file here"),
-        ("mark", "e", "", "mark or unmark a row"),
-        ("op_move", "m", "", "move marked items here"),
-        ("op_copy", "c", "", "copy marked items here"),
-        ("op_cut", "x", "", "cut marked items here"),
-        ("op_delete", "d", "", "delete marked items"),
+        ("rename", "r", "", "rename this file or folder"),
+        ("mark", "e", "", "mark or unmark a row (any time)"),
+        ("op_move", "m", "", "move marked items here (mark first)"),
+        ("op_copy", "c", "", "copy marked items here (mark first)"),
+        ("op_cut", "x", "", "cut marked items here (mark first)"),
+        ("op_delete", "d", "", "delete marked items (mark first)"),
     ]),
     ("bookmarks", [
         ("bookmark_set", "B", "", "bookmark here, then a digit"),
@@ -196,7 +197,7 @@ KEY_SECTIONS: list[tuple[str, list[tuple[str | None, str, str, str]]]] = [
         ("panel_settings", ",", "", "colours, keys, bookmarks"),
     ]),
     ("leaving", [
-        (None, "esc", "", "back out of a mode or a panel"),
+        (None, "esc", "", "drop marks, close a panel, else quit"),
         (None, "q", "", "quit -- always, from anywhere"),
         (None, "^c", "^d", "quit"),
     ]),
@@ -1220,8 +1221,8 @@ class Screen:
     def resume(self) -> None:
         """Take the terminal back after the child exits. The tcflush
         discards whatever the child's own exit left queued -- undrained, a
-        stray keystroke decodes through key() as a real key and, with no
-        pending_op, can quit the browser outright."""
+        stray keystroke decodes through key() as a real key and, with
+        nothing marked, can quit the browser outright."""
         tty.setcbreak(self.fd)
         termios.tcflush(self.fd, termios.TCIFLUSH)
         sys.stdout.write("\x1b[?1049h\x1b[?25l")
@@ -1327,8 +1328,9 @@ class Navigateur:
         self.colors = cfg["colors"]
         self.show_hidden = bool(cfg["behavior"]["show_hidden"])
         self.expanded: set[str] = set()
-        self.marked: set[str] = set()
-        self.pending_op: str | None = None  # None, "move", "copy", "cut", or "delete"
+        self.marked: set[str] = set()  # the only move/copy/cut/delete state:
+        # a free-standing selection. A verb key (m/c/x/d) consumes it; the verb
+        # itself lives only for that one keypress, passed as a parameter.
         self.cursor = 0
         self.root_selected = False  # see reveal_path(): True only from a
         # teleport until the next deliberate cursor move -- self.root can
@@ -1544,21 +1546,34 @@ class Navigateur:
         return screen.key(None)
 
     def read_line(self, screen: Screen, cols: int, height: int,
-                  prompt: str) -> str | None:
+                  prompt: str, initial: str = "") -> str | None:
         """Block for a typed line after `prompt`, repainting the
         in-progress buffer on every keystroke via self.message -- the
         multi-character sibling of read_slot(). Returns the typed text, or
         None on ESC. Ctrl-c/ctrl-d come back raw so the caller can still
         quit the browser from inside this prompt, the same contract
-        read_slot()'s callers use."""
-        buf = ""
+        read_slot()'s callers use. `initial` pre-fills the buffer (cursor at
+        the end), so `r` can hand back the current name to be edited.
+
+        A caret position is tracked so the line can be edited in the middle,
+        not just at the end: ←/→ (or Ctrl-B/Ctrl-F) move it, Ctrl-A/Ctrl-E
+        jump to the ends, Ctrl-W deletes the word behind it, Ctrl-U/Ctrl-K
+        cut to the start/end. All of these are single control bytes or the
+        arrow tokens key() already decodes, so nothing here needs a wider
+        escape table."""
+        buf, pos = initial, len(initial)
         while True:
             budget = max(0, cols - 3)
-            shown = prompt + buf
-            if len(shown) > budget - 1:
-                room = budget - len(prompt) - 1
-                shown = prompt + ("…" + buf[-(room - 1):] if room > 1 else "")
-            self.message = shown + "_"
+            caret = buf[:pos] + "_" + buf[pos:]
+            if len(prompt) + len(caret) <= budget:
+                self.message = prompt + caret
+            else:
+                # Slide a fixed-width window so the caret stays visible --
+                # a name longer than the line is still editable in the middle.
+                room = max(1, budget - len(prompt))
+                start = max(0, min(pos - room // 2, len(caret) - room))
+                clip = caret[start:start + room]
+                self.message = prompt + (("…" + clip[1:]) if start else clip)
             screen.paint(self.frame(cols, height))
             key = screen.key(None)
             if key is None:
@@ -1569,10 +1584,30 @@ class Navigateur:
                 return None
             if key == "ENTER":
                 return buf
-            if key in ("\x7f", "\x08"):
-                buf = buf[:-1]
+            if key in ("\x7f", "\x08"):            # backspace: erase before caret
+                if pos:
+                    buf, pos = buf[:pos - 1] + buf[pos:], pos - 1
+            elif key in ("LEFT", "\x02"):          # ← / Ctrl-B
+                pos = max(0, pos - 1)
+            elif key in ("RIGHT", "\x06"):         # → / Ctrl-F
+                pos = min(len(buf), pos + 1)
+            elif key == "\x01":                    # Ctrl-A: start of line
+                pos = 0
+            elif key == "\x05":                    # Ctrl-E: end of line
+                pos = len(buf)
+            elif key == "\x15":                    # Ctrl-U: cut to start of line
+                buf, pos = buf[pos:], 0
+            elif key == "\x0b":                    # Ctrl-K: cut to end of line
+                buf = buf[:pos]
+            elif key == "\x17":                    # Ctrl-W: delete word behind caret
+                i = pos
+                while i and buf[i - 1].isspace():
+                    i -= 1
+                while i and not buf[i - 1].isspace():
+                    i -= 1
+                buf, pos = buf[:i] + buf[pos:], i
             elif len(key) == 1 and key.isprintable():
-                buf += key
+                buf, pos = buf[:pos] + key + buf[pos:], pos + 1
 
     # -- actions ----------------------------------------------------------
 
@@ -1682,36 +1717,54 @@ class Navigateur:
             return None
         return ["xdg-open", str(path.parent if reveal else path)]
 
-    def edit_it(self, screen: Screen) -> None:
-        """E -- open the highlighted row (file or folder) in the editor, in the
-        foreground, in this terminal. Unlike open_it()'s GUI handoff or
-        spawn_terminal()'s detached window, a terminal editor needs the real
-        tty, so the alt screen and raw mode step aside for it via
-        Screen.suspend()/resume() rather than the Popen-and-forget pattern
-        those two use."""
+    def _edit_targets(self) -> list[Path]:
+        """What `E` opens: the marked paths (sorted) if any, else the
+        highlighted row. Marks are path strings independent of self.rows, so
+        sort those directly -- walking self.rows would silently drop a mark
+        that lives in a collapsed subtree."""
+        if self.marked:
+            return [Path(p) for p in sorted(self.marked)]
         row = self.current()
-        if row is None:
-            return
-        self._run_editor(screen, row.path)
+        return [row.path] if row is not None else []
 
-    def _run_editor(self, screen: Screen, path: Path) -> None:
+    def edit_it(self, screen: Screen) -> None:
+        """E -- open the marked files (or, with nothing marked, the highlighted
+        row) in the editor, in the foreground, in this terminal. Unlike
+        open_it()'s GUI handoff or spawn_terminal()'s detached window, a
+        terminal editor needs the real tty, so the alt screen and raw mode step
+        aside for it via Screen.suspend()/resume() rather than the
+        Popen-and-forget pattern those two use. `E` does NOT clear the marks --
+        they are a pending copy/move batch it is only previewing."""
+        targets = self._edit_targets()
+        if not targets:
+            return
+        self._run_editor(screen, targets)
+
+    def _run_editor(self, screen: Screen, paths: list[Path]) -> None:
         """The terminal-editor handoff, shared by `E` and by `↵` on a source
         file. The suspend/resume pair is the whole point: restore() would also
         clear self.saved and disarm the wakeup fd, which is right for quitting
-        and wrong for a loan."""
+        and wrong for a loan.
+
+        More than one path opens in split windows (`nvim -o f1 f2 f3`), but
+        only when the resolved editor is nvim/vim -- `-o` is a vim flag and
+        would be a filename to a bare $EDITOR like nano or code."""
         argv = editor_argv()
         if argv is None:
             self.message = "no editor -- set $EDITOR, or install nvim"
             return
+        flags = ["-o"] if len(paths) > 1 and Path(argv[0]).name in ("nvim", "vim") else []
         screen.suspend()
         try:
-            subprocess.run(argv + [str(path)], check=False)
+            subprocess.run(argv + flags + [str(p) for p in paths], check=False)
         except OSError as exc:
             self.message = f"{argv[0]} failed: {exc}"
         finally:
             screen.resume()
         self.rebuild()  # an editor can rename/create/delete under us
-        self.select_path(path)
+        if len(paths) == 1:
+            self.select_path(paths[0])  # a multi-open leaves the cursor put --
+            # paths[0] may sit in a collapsed subtree
 
     def open_file(self, row: Row, screen: Screen) -> None:
         """`↵` on a file. Three routes, decided by extension:
@@ -1733,7 +1786,7 @@ class Navigateur:
         if suffix in MD_SUFFIXES:
             self.open_reader(row.path)
         elif suffix in EDIT_SUFFIXES or row.path.name in EDIT_NAMES:
-            self._run_editor(screen, row.path)
+            self._run_editor(screen, [row.path])
         else:
             self.open_it()
 
@@ -1876,16 +1929,64 @@ class Navigateur:
             else f" (hidden -- {self.keys['hidden']} to show)"
         self.message = f"created {name}{hint}"
 
-    def toggle_mark(self) -> None:
-        """e -- mark or unmark the highlighted row while a move, copy, cut
-        or delete is pending. Marks are path strings, same convention as
-        `expanded`: independent of `self.rows`, so collapsing a marked
-        folder never unmarks it. Marks are shared across all four verbs --
-        switching which verb key you press keeps whatever is already
-        marked."""
-        if self.pending_op is None:
-            self.message = "press m to move, c to copy, x to cut, d to delete"
+    def rename_it(self, screen: Screen, cols: int, height: int) -> None:
+        """r -- rename the highlighted row in place. The name is edited in a
+        pre-filled hint-line prompt (read_line's `initial`), then a `y`
+        confirm, then Path.rename within the same directory.
+
+        root_selected is refused for the same reason `↵` refuses it: after a
+        bookmark teleport the highlighted row is list_dir()'s row 0, not
+        something the user pointed at. name_ok() is the shared guard (no `/`,
+        no `.`/`..`); the os.path.lexists() collision check is create_file()'s
+        rule, and carries the same small TOCTOU window _op_batch() accepts."""
+        row = self.current()
+        if row is None or self.root_selected:
+            self.message = "nothing here to rename"
             return
+        old = row.path
+        new = self.read_line(screen, cols, height, "rename: ", initial=old.name)
+        if new in ("\x03", "\x04"):
+            return  # ctrl-c / ctrl-d still quit from inside the prompt
+        if not new or new == old.name:
+            self.message = "rename cancelled"
+            return
+        why = name_ok(new)
+        if why:
+            self.message = why
+            return
+        target = old.parent / new
+        if os.path.lexists(target):
+            self.message = f"'{new}' already exists"
+            return
+        # try_op()'s rule: build the prompt, and if it doesn't fit, elide the
+        # name from the LEFT so "y to confirm" is never what falls off.
+        lead, tail = "rename to ", "? -- y to confirm"
+        budget = max(0, cols - 3)
+        shown = new
+        if len(lead) + len(shown) + len(tail) > budget:
+            room = budget - len(lead) - len(tail)
+            shown = "…" + new[-(room - 1):] if room > 1 else ""
+        reply = self.read_slot(screen, cols, height, f"{lead}{shown}{tail}")
+        if reply in ("\x03", "\x04"):
+            return
+        if reply != "y":
+            self.message = "rename cancelled"
+            return
+        try:
+            old.rename(target)
+        except OSError as exc:
+            self.message = f"could not rename: {exc}"
+            return
+        self.rebuild()
+        self.select_path(target)
+        self.message = f"renamed to {new}"
+
+    def toggle_mark(self) -> None:
+        """e -- mark or unmark the highlighted row, any time, no mode. Marks
+        are path strings, same convention as `expanded`: independent of
+        `self.rows`, so collapsing a marked folder never unmarks it. A verb
+        key (m/c/x/d) then acts on whatever is marked -- the marks aren't tied
+        to one verb."""
         row = self.current()
         if row is None:
             self.message = "nothing here to mark"
@@ -1896,12 +1997,14 @@ class Navigateur:
         else:
             self.marked.add(key)
         n = len(self.marked)
-        verb = self.pending_op
-        where = "" if verb == "delete" else " here"
-        self.message = (f"{n} marked -- ↵ to {verb}{where}" if n
-                        else f"{verb} mode -- e to mark, ↵ to {verb}{where}")
+        if n:
+            mv, cp = self.keys["op_move"], self.keys["op_copy"]
+            ct, dl = self.keys["op_cut"], self.keys["op_delete"]
+            self.message = f"{n} marked -- {mv}/{cp}/{ct} here, {dl} to delete"
+        else:
+            self.message = "marks cleared"
 
-    def _op_batch(self, dest: Path) -> list[Path] | None:
+    def _op_batch(self, dest: Path, verb: str) -> list[Path] | None:
         """The marked set, reduced to what actually needs to move/copy/cut:
         nested marks collapsed onto their ancestor (relocating/copying the
         ancestor already carries the descendant with it), and items already
@@ -1910,8 +2013,8 @@ class Navigateur:
         or a name collision), so the user can pick a different destination
         without re-marking everything. Shared by all three verbs since the
         preflight (nested-mark collapse, duplicate names, lexists collision)
-        doesn't depend on which one is relocating or duplicating the batch."""
-        verb = self.pending_op
+        doesn't depend on which one is relocating or duplicating the batch;
+        `verb` only names the operation in the refusal message."""
         marks = sorted((Path(p) for p in self.marked), key=lambda p: len(p.parts))
         top: list[Path] = []
         for p in marks:
@@ -1935,19 +2038,21 @@ class Navigateur:
                 return None
         return batch
 
-    def try_op(self, screen: Screen, cols: int, height: int) -> None:
-        """↵, once something is marked -- validate the batch, confirm with
-        `y`, then move, copy or cut per self.pending_op. Any reply other than
-        `y` is a full cancel, mirroring the B/b prompt's "anything else
-        cancels" rule."""
-        verb = self.pending_op
+    def try_op(self, screen: Screen, cols: int, height: int, verb: str) -> None:
+        """The verb key (m/c/x), once something is marked -- validate the
+        batch, confirm with `y`, then move, copy or cut per `verb`. Any reply
+        other than `y` is a cancel that *keeps* the marks, so you can retry or
+        press a different verb key without re-marking -- unlike try_delete,
+        which has already touched the disk and must clear on every exit."""
         dest = self.published_dir()
-        batch = self._op_batch(dest)
+        batch = self._op_batch(dest, verb)
         if batch is None:
             return
         if not batch:
-            self.marked.clear()
-            self.pending_op = None
+            # Every marked item is already in `dest`. Keep the marks -- this
+            # is the "you're standing in the wrong directory" case, so let the
+            # user walk somewhere else and press the verb again, same as a
+            # cancel or an _op_batch refusal.
             self.message = f"nothing to {verb} -- already there"
             return
         # _hint_line's own truncation drops whole segments rather than
@@ -1976,9 +2081,7 @@ class Navigateur:
         if reply in ("\x03", "\x04"):
             return  # ctrl-c / ctrl-d still quit from inside the prompt
         if reply != "y":
-            self.marked.clear()
-            self.pending_op = None
-            self.message = f"{verb} cancelled"
+            self.message = f"{verb} cancelled -- marks kept"
             return
         if verb == "copy":
             self.do_copy(dest, batch)
@@ -2006,7 +2109,6 @@ class Navigateur:
         else:
             self.message = f"{action} {moved} item{'s' if moved != 1 else ''} to {home_short(dest)}"
         self.marked.clear()
-        self.pending_op = None
         self.open_node(dest)
         self.rebuild()
         self.select_path(dest)
@@ -2032,7 +2134,6 @@ class Navigateur:
         else:
             self.message = f"copied {copied} item{'s' if copied != 1 else ''} to {home_short(dest)}"
         self.marked.clear()
-        self.pending_op = None
         self.open_node(dest)
         self.rebuild()
         self.select_path(dest)
@@ -2042,7 +2143,9 @@ class Navigateur:
         marks collapsed onto their ancestor, same rule as _op_batch's first
         step. There is no destination for delete, so none of _op_batch's
         collision/lexists checks apply -- this is deliberately not a call to
-        _op_batch with dest=None."""
+        _op_batch with dest=None. try_delete clears the marks on *every* exit
+        (it mutates the disk mid-loop) -- deliberately unlike try_op, which
+        keeps them on a cancel."""
         marks = sorted((Path(p) for p in self.marked), key=lambda p: len(p.parts))
         top: list[Path] = []
         for p in marks:
@@ -2061,7 +2164,6 @@ class Navigateur:
         batch = self._delete_batch()
         if not batch:
             self.marked.clear()
-            self.pending_op = None
             self.message = "nothing to delete"
             return
         deleted = 0
@@ -2080,11 +2182,10 @@ class Navigateur:
                 if reply in ("\x03", "\x04"):
                     # Unlike try_op's ctrl-c (nothing mutated yet at that
                     # point), earlier items in this loop may already be
-                    # gone from disk -- clear up the same as a cancel so
-                    # `marked`/`pending_op` and the tree don't go stale.
+                    # gone from disk -- clear the marks the same as a cancel
+                    # so `marked` and the tree don't go stale.
                     self.message = f"deleted {deleted} of {len(batch)} -- cancelled"
                     self.marked.clear()
-                    self.pending_op = None
                     self.rebuild()
                     return
                 if reply == "Y":
@@ -2092,7 +2193,6 @@ class Navigateur:
                 elif reply != "y":
                     self.message = f"deleted {deleted} of {len(batch)} -- cancelled"
                     self.marked.clear()
-                    self.pending_op = None
                     self.rebuild()
                     return
             try:
@@ -2103,13 +2203,11 @@ class Navigateur:
             except (OSError, shutil.Error) as exc:
                 self.message = f"deleted {deleted} of {len(batch)} -- failed on {p.name}: {exc}"
                 self.marked.clear()
-                self.pending_op = None
                 self.rebuild()
                 return
             deleted += 1
         self.message = f"deleted {deleted} item{'s' if deleted != 1 else ''}"
         self.marked.clear()
-        self.pending_op = None
         self.rebuild()
 
     # -- render -----------------------------------------------------------
@@ -2181,13 +2279,14 @@ class Navigateur:
         segments rather than slicing a word in half."""
         if self.message:
             hint = self.message
-        elif self.pending_op:
-            verb = self.pending_op
+        elif self.marked:
+            # Marks are a free-standing selection now, not a mode: a verb key
+            # (read live -- `mark`/op_* can all be rebound) consumes them. Keep
+            # this verb-agnostic; toggle_mark()'s own message says the same.
             n = len(self.marked)
-            mark = self.keys["mark"]
-            where = "" if verb == "delete" else " here"
-            hint = (f"{verb} mode: {n} marked -- {mark} to mark, ↵ to {verb}{where}"
-                    if n else f"{verb} mode -- {mark} to mark, ↵ to {verb}{where}")
+            mv, cp = self.keys["op_move"], self.keys["op_copy"]
+            ct, dl = self.keys["op_cut"], self.keys["op_delete"]
+            hint = f"{n} marked -- {mv}/{cp}/{ct} here, {dl} to delete"
         else:
             # Deliberately short. The full list used to live here and was
             # truncated segment by segment, so on a narrow terminal most of the
@@ -2725,7 +2824,7 @@ class Navigateur:
                 self.reader_stack.append(here)
             return
         if dest.suffix.lower() in EDIT_SUFFIXES or dest.name in EDIT_NAMES:
-            self._run_editor(screen, dest)
+            self._run_editor(screen, [dest])
             screen.prev = []  # the editor owned the screen; repaint whole
             return
         self._open_external(str(dest))
@@ -2771,7 +2870,7 @@ class Navigateur:
             self.reader_back()
         elif action == "edit":
             if self.reader is not None:
-                self._run_editor(screen, self.reader.path)
+                self._run_editor(screen, [self.reader.path])
                 screen.prev = []
                 self.open_reader(self.reader.path)  # it may have been edited
         elif action == "down":
@@ -2867,48 +2966,32 @@ class Navigateur:
             if key == "q":
                 return
             elif key == "ESC":
-                # Esc backs out of move/copy/cut mode without touching the
-                # marked files -- same as pressing Enter with nothing marked,
-                # just reachable without emptying the marks first. Outside a
-                # pending op it's still an alias for q.
-                if self.pending_op:
-                    verb = self.pending_op
+                # Marks are a free-standing selection, not a mode, so `esc`
+                # just drops them without touching a file -- and only then
+                # falls back to its old job as an alias for q.
+                if self.marked:
                     self.marked.clear()
-                    self.pending_op = None
-                    self.message = f"{verb} cancelled"
+                    self.message = "marks cleared"
                 else:
                     return
             elif key == "ENTER":
-                # Context-sensitive like Esc above: confirms a pending
-                # move/copy/cut/delete (the verb key itself only enters/
-                # refreshes the mode now, see the op_* dispatch below) and
-                # falls through to maybe_publish() instead of returning.
-                # With no pending op it opens the highlighted file, or --
-                # on a folder -- is the plain "cd here and quit". A .md
-                # opens the reader, which is a *mode*: the browser keeps
-                # running behind it, so this branch must not return either.
-                if self.pending_op:
-                    verb = self.pending_op
-                    if not self.marked:
-                        self.pending_op = None
-                        self.message = f"{verb} cancelled -- nothing marked"
-                    elif verb == "delete":
-                        self.try_delete(screen, cols, height)
-                    else:
-                        self.try_op(screen, cols, height)
+                # Two-way now (the verb keys run the op themselves -- see the
+                # op_* dispatch below): `↵` opens the highlighted file, or --
+                # on a folder -- is the plain "cd here and quit". A .md opens
+                # the reader, which is a *mode*: the browser keeps running
+                # behind it, so the file branch falls through to
+                # maybe_publish() rather than returning.
+                #
+                # root_selected is load-bearing, not defensive: after a
+                # reveal_path() teleport published_dir() ignores the row on
+                # purpose, so `↵` must stay "cd to the root" even when row 0
+                # happens to be a file.
+                row = self.current()
+                if not self.root_selected and row is not None and not row.is_dir:
+                    self.open_file(row, screen)
                 else:
-                    # root_selected is load-bearing here, not defensive:
-                    # after a reveal_path() teleport published_dir() ignores
-                    # the row on purpose, so `↵` must stay "cd to the root"
-                    # even when row 0 happens to be a file. Opening a file
-                    # falls through to maybe_publish() rather than returning,
-                    # exactly as the pending_op branch above does.
-                    row = self.current()
-                    if not self.root_selected and row is not None and not row.is_dir:
-                        self.open_file(row, screen)
-                    else:
-                        self.chosen = self.published_dir()
-                        return
+                    self.chosen = self.published_dir()
+                    return
             elif action == "down":
                 self.move(count)
             elif action == "up":
@@ -2993,18 +3076,24 @@ class Navigateur:
                         self.reveal_path(target)
                         self.message = f"went to bookmark {slot}"
             elif action in ("op_move", "op_copy", "op_cut", "op_delete"):
-                # Entering fresh, switching verb mid-mark, or re-pressing the
-                # same verb key -- all three just (re-)enter the mode and
-                # refresh the hint now. The marks (if any) carry over
-                # unchanged either way; confirming is Enter's job, not a
-                # second press of this key (see the ENTER branch above).
+                # The verb key runs the confirm directly on whatever is marked
+                # -- no mode to arm first. `verb` lives only for this keypress;
+                # it is a parameter, never an instance field.
+                #
+                # All four verbs *require* a mark. There is no implicit
+                # "act on the cursor row" fallback: the destination for
+                # move/copy/cut is published_dir(), which is read off the same
+                # cursor row, so a one-item batch taken from the cursor can
+                # only ever be "already there" (file) or "into itself"
+                # (folder) -- two refusals and no success. `e` first, then the
+                # verb.
                 verb = action[3:]
-                self.pending_op = verb
-                n = len(self.marked)
-                mark = self.keys["mark"]
-                where = "" if verb == "delete" else " here"
-                self.message = (f"{n} marked -- ↵ to {verb}{where}" if n
-                                 else f"{verb} mode -- {mark} to mark, ↵ to {verb}{where}")
+                if not self.marked:
+                    self.message = f"nothing marked -- {self.keys['mark']} marks a row"
+                elif verb == "delete":
+                    self.try_delete(screen, cols, height)
+                else:
+                    self.try_op(screen, cols, height, verb)
             elif action == "new_file":
                 name = self.read_line(screen, cols, height, "new file: ")
                 if name in ("\x03", "\x04"):
@@ -3013,6 +3102,8 @@ class Navigateur:
                     self.message = "new file cancelled"
                 else:
                     self.create_file(name)
+            elif action == "rename":
+                self.rename_it(screen, cols, height)
             elif action == "mark":
                 self.toggle_mark()
             elif action == "hidden":
