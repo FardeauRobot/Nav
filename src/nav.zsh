@@ -307,6 +307,7 @@ _nav_announce() {
 }
 
 _nav_join() {                   # $1 group name, or "solo" to leave
+  local prev=$_NAV_GROUP       # named in the toggle-off line below
   if [[ $1 == solo ]]; then
     _nav_group_write $_NAV_TTY "" || {
       print -r -- "navigateur: cannot write $NAV_STATE/roles/$_NAV_TTY" >&2; return 1
@@ -323,7 +324,18 @@ _nav_join() {                   # $1 group name, or "solo" to leave
   fi
   unset _NAV_AT               # re-sync from scratch on the next prompt
   _nav_reconcile
-  _nav_announce
+  # One line naming what just happened -- `nav 1` is a verb, and a success
+  # confirmation is what the user expects back.  Not _nav_announce (kept for
+  # `navigate status`): that reports resulting *state*, so a fresh join and a
+  # no-op re-join read identically and a toggle-off never says what it left.
+  if [[ -n $_NAV_GROUP ]]; then
+    local m; [[ -n $_NAV_FD ]] && m=live || m="lazy (moves on your next prompt)"
+    print -r -- "navigateur: joined group $_NAV_GROUP ($_NAV_TTY) · $m"
+  elif [[ -n $prev ]]; then
+    print -r -- "navigateur: left group $prev ($_NAV_TTY) · now solo"
+  else
+    print -r -- "navigateur: already solo ($_NAV_TTY)"
+  fi
 }
 
 _nav_status() {                  # $1 group, or empty for every group
