@@ -71,9 +71,9 @@ def name_ok(name: str) -> str:
 
 # One group's broadcast directory. The group is in the *path* here and in the
 # *content* of roles/<tty>, and the split is forced by which paths are hot:
-# read_role() reads one file by a name it already knows and runs at every prompt
-# through nav.zsh's _nav_reconcile, while publish() globs its subscribers on
-# every cursor move and must not decide membership by reading role files.
+# read_group() reads one file by a name it already knows and runs at every
+# prompt through nav.zsh's _nav_reconcile, while publish() globs its subscribers
+# on every cursor move and must not decide membership by reading role files.
 def sub_dir(group: str) -> Path:
     return GROUPS / group / "sub"
 
@@ -125,8 +125,8 @@ border      = "#504945"
 selected_bg = "#3c3836"
 
 [behavior]
-show_hidden    = false
-follow_default = false   # start this window as the leader
+show_hidden   = false
+group_default = false   # join the `default` peer group on every launch
 '''
 
 DEFAULTS = {
@@ -138,7 +138,7 @@ DEFAULTS = {
         "border": "#504945",
         "selected_bg": "#3c3836",
     },
-    "behavior": {"show_hidden": False, "follow_default": False},
+    "behavior": {"show_hidden": False, "group_default": False},
 }
 
 
@@ -188,9 +188,8 @@ KEY_SECTIONS: list[tuple[str, list[tuple[str | None, str, str, str]]]] = [
         ("bookmark_set", "B", "", "bookmark here, then a digit"),
         ("bookmark_go", "b", "", "jump to a bookmark digit"),
     ]),
-    ("following", [
-        ("lead", "F", "", "lead this group, or stop"),
-        ("follow", "f", "", "follow this group, or stop"),
+    ("grouping", [
+        ("group", "f", "", "join or leave this window's group"),
     ]),
     ("panels", [
         ("panel_keys", "?", "", "this table"),
@@ -1009,83 +1008,54 @@ def self_tty() -> str | None:
     return None
 
 
-def read_role(me: str | None) -> tuple[str, str]:
-    """This window's (role, group): leader, follower or solo, and which group.
+def read_group(me: str | None) -> str | None:
+    """This window's peer group, or None when solo.
 
     $NAV_STATE/roles/<tty> is the single source of truth and the seam with the
-    shell. It holds "<role> <group>"; a bare "leader" with no second field is
-    the pre-groups format and still reads as group `default`, so role files
-    written by an older version stay valid. Writing it is all this process can
-    do about a role -- only a shell can register a FIFO with `zle -F` -- so
-    nav.zsh's _nav_reconcile brings the live machinery in line afterwards. An
-    unreadable or junk value in either field degrades to solo rather than
-    costing you the browser."""
+    shell. It now holds just the group name; a legacy "<role> <group>" line
+    ("leader 3", "follower default") written by a pre-groups version is still
+    read -- the group is taken from it, the role word dropped -- so old role
+    files stay valid. Writing it is all this process can do about membership --
+    only a shell can register a FIFO with `zle -F` -- so nav.zsh's
+    _nav_reconcile brings the live machinery in line afterwards. An unreadable
+    or junk value degrades to solo rather than costing you the browser."""
     if me is None:
-        return "solo", DEFAULT_GROUP
+        return None
     try:
         parts = (ROLES / me).read_text().split()
     except OSError:
-        return "solo", DEFAULT_GROUP
-    role = parts[0] if parts else ""
-    group = parts[1] if len(parts) > 1 else DEFAULT_GROUP
-    if role not in ("leader", "follower") or not group_ok(group):
-        return "solo", DEFAULT_GROUP
-    return role, group
-
-
-def find_leader(me: str | None, group: str) -> str | None:
-    """The tty leading `group`, or None. The mirror of nav.zsh's
-    _nav_find_leader.
-
-    `me` is excluded: a window asking "is there a leader for me to follow?" must
-    not find itself, succeed, and demote -- that leaves nobody leading, which is
-    the state the refusal exists to prevent. This globs ROLES, so it belongs on
-    the key paths only, never in the redraw loop."""
-    try:
-        entries = sorted(ROLES.iterdir())
-    except OSError:
         return None
-    for q in entries:
-        if q.name == me:
-            continue
-        if read_role(q.name) == ("leader", group):
-            return q.name
-    return None
+    if not parts:
+        return None
+    if parts[0] in ("leader", "follower"):
+        group = parts[1] if len(parts) > 1 else DEFAULT_GROUP
+    else:
+        group = parts[0]
+    return group if group_ok(group) else None
 
 
-def write_role(me: str | None, role: str, group: str = DEFAULT_GROUP) -> bool:
-    if me is None or not group_ok(group):
+def write_group(me: str | None, group: str | None) -> bool:
+    """Join `group`, or leave (None). No exclusivity sweep any more: every
+    member of a group is a peer, so there is nothing to evict."""
+    if me is None:
         return False
     try:
         ROLES.mkdir(parents=True, exist_ok=True)
-        if role == "solo":
+        if group is None:
             (ROLES / me).unlink(missing_ok=True)
+        elif group_ok(group):
+            (ROLES / me).write_text(group + "\n")
         else:
-            (ROLES / me).write_text(role + " " + group + "\n")
+            return False
     except OSError:
         return False
-    if role == "leader":
-        # Exactly one leader *per group*. Enforced only here, on promotion --
-        # reading a role never globs this directory, it reads one file by name.
-        try:
-            others = [q for q in ROLES.iterdir() if q.name != me]
-        except OSError:
-            others = []
-        for q in others:
-            # Parsed, never a prefix match on "leader": with the group in the
-            # content, taking group 3 would otherwise evict group 1's leader.
-            if read_role(q.name) == ("leader", group):
-                try:
-                    q.unlink()
-                except OSError:
-                    pass
     return True
 
 
 def read_cwd(group: str) -> str | None:
-    """Where the group's leader is. Both publishers -- publish() below and
-    nav.zsh's _nav_publish -- write this file, so it is the one place a follower
-    has to look."""
+    """Where the group last broadcast from. Both publishers -- publish() below
+    and nav.zsh's _nav_publish -- write this file, so it is the one place a
+    member has to look."""
     try:
         return cwd_file(group).read_text().strip() or None
     except OSError:
@@ -1094,10 +1064,10 @@ def read_cwd(group: str) -> str | None:
 
 def read_msg(dest: str, group: str) -> str:
     """The identity of the last broadcast: its generation stamp and its
-    directory. A publish is an event, not a value -- a leader re-selecting the
-    directory a follower has since left writes a byte-identical `cwd`, and
-    without the stamp that is indistinguishable from the stale file the
-    follower already declined. `self.seen` holds one of these, never a path."""
+    directory. A publish is an event, not a value -- a member re-selecting the
+    directory another has since left writes a byte-identical `cwd`, and without
+    the stamp that is indistinguishable from the stale file already declined.
+    `self.seen` holds one of these, never a path."""
     try:
         gen = gen_file(group).read_text().strip()
     except OSError:
@@ -1109,7 +1079,7 @@ def publish(path: Path, me: str | None, group: str) -> None:
     """Broadcast a directory to every terminal subscribed to `group`."""
     payload = (str(path) + "\n").encode()
     try:
-        # sub/ too: a leader can publish into a group no follower has joined.
+        # sub/ too: a member can publish into a group nobody else has joined.
         sub_dir(group).mkdir(parents=True, exist_ok=True)
         cwd_file(group).write_text(str(path) + "\n")
         gen_file(group).write_text(str(time.time_ns()) + "\n")  # see read_msg()
@@ -1264,7 +1234,7 @@ class Screen:
         self.prev = list(lines)
 
     def key(self, timeout: float | None = None) -> str | None:
-        """timeout is how a follower stays responsive to the leader while
+        """timeout is how a group member stays responsive to the others while
         nobody is typing: select first, and report None when it expires.
 
         Waiting on the wakeup pipe as well as the keyboard is what lets a
@@ -1340,14 +1310,16 @@ class Navigateur:
         self.rows: list[Row] = []
         self.me = self_tty()
         self.published: str | None = None
-        self.role, self.group = read_role(self.me)
-        self.seen = None  # the message a follower has already acted on
-        if self.role == "solo" and bool(cfg["behavior"]["follow_default"]):
-            # The old broadcast-by-default switch, read as "start this window
-            # leading the default group". A saved role always wins: the config
-            # only gets a say when there is no role file at all.
-            write_role(self.me, "leader", DEFAULT_GROUP)
-            self.role, self.group = "leader", DEFAULT_GROUP
+        self.group = read_group(self.me)
+        self.last_group: str | None = None  # per-process toggle memory for `f`,
+        # the analogue of nav.zsh's _NAV_LASTGROUP; never a source of truth.
+        self.seen = None  # the message this window has already acted on
+        if self.group is None and bool(cfg["behavior"]["group_default"]):
+            # The old broadcast-by-default switch, read as "join the default
+            # peer group on launch". A saved group always wins: the config only
+            # gets a say when there is no role file at all.
+            if write_group(self.me, DEFAULT_GROUP):
+                self.group = DEFAULT_GROUP
         self.chosen: Path | None = None
         self.message = ""
         self.count_buf = ""  # digits typed so far for a pending "5j"-style count
@@ -1428,10 +1400,11 @@ class Navigateur:
     def published_dir(self) -> Path:
         """THE publish rule: the nearest enclosing directory of the highlighted
         row -- the row itself when it is a directory, its parent when it is a
-        file. Everything (followers, $NAV_LASTDIR) reads this one function.
+        file. Everything (the other members, $NAV_LASTDIR) reads this one
+        function.
 
         root_selected short-circuits this the instant reveal_path() teleports
-        the tree to a bookmark/leader target: self.root can never be a row,
+        the tree to a bookmark/sync target: self.root can never be a row,
         so there is nothing for the cursor to land on except row 0 -- almost
         always a subdirectory of the target, since list_dir() sorts
         directories first. Without this check published_dir() would report
@@ -1445,8 +1418,8 @@ class Navigateur:
         return row.path if row.is_dir else row.path.parent
 
     def maybe_publish(self) -> None:
-        if self.role != "leader":
-            return  # structural: a follower can never publish
+        if self.group is None:
+            return  # solo: structurally incapable of broadcasting
         target = str(self.published_dir())
         if target == self.published:
             return  # de-dupe: arrowing between sibling files must not re-fire
@@ -1459,25 +1432,28 @@ class Navigateur:
                 self.cursor = i
                 return
 
-    def set_role(self, role: str, group: str | None = None) -> bool:
-        """F and f take no argument, so they act on this window's current group
-        -- falling back to `default` -- rather than yanking a window out of the
-        group it joined with `n lead <g>` / `n follow <g>`."""
-        group = group or self.group or DEFAULT_GROUP
-        if not write_role(self.me, role, group):
+    def join_group(self, group: str | None) -> bool:
+        """`f` takes no argument: None leaves this window's group (remembered in
+        self.last_group so a second `f` rejoins it), a name joins that group.
+        The role file is the authority; this only sets the intent and lets the
+        shell reconcile on the next prompt."""
+        if group is None and self.group is not None:
+            self.last_group = self.group
+        if not write_group(self.me, group):
             self.message = "cannot write the role file"
             return False
-        self.role = role
         self.group = group
-        self.published = None  # a fresh leader must state where it is
+        self.published = None  # a fresh member must state where it is
         self.seen = None       # a seen-stamp never carries across groups
         return True
 
-    def sync_from_leader(self, force: bool = False) -> bool:
-        """Follower poll. Reads the group's `cwd` rather than this terminal's
+    def sync_from_group(self, force: bool = False) -> bool:
+        """Member poll. Reads the group's `cwd` rather than this terminal's
         FIFO: the shell holds that FIFO open for `zle -F` and a second reader
         would race it for the bytes. The shell keeps its own copy of the
         message, so quitting still lands the shell in the same place."""
+        if self.group is None:
+            return False
         dest = read_cwd(self.group)
         if dest is None:
             return False
@@ -1491,13 +1467,17 @@ class Navigateur:
         # "Already there" has to mean this directory's *contents* are on screen,
         # not merely that the cursor sits on its row. A folder under the cursor
         # is collapsed until something expands it, so testing published_dir()
-        # alone left the leader's directory selected and unopened -- and stuck
+        # alone left the broadcast directory selected and unopened -- and stuck
         # that way, since every later message naming it took this same exit.
         # The root is never in `expanded` and is always open.
         if target == self.published_dir() and (
                 target == self.root or self.is_open(target)):
             return False
         self.reveal_path(target)
+        # Echo suppression, the mirror of _NAV_AT in nav.zsh: a followed cd must
+        # not rebroadcast on the next maybe_publish(). published_dir(), not
+        # `dest` -- it is the exact value maybe_publish() compares against.
+        self.published = str(self.published_dir())
         return True
 
     def reveal_path(self, target: Path) -> None:
@@ -1618,7 +1598,7 @@ class Navigateur:
 
     def enter(self) -> None:
         """l -- expand a folder. On a file, expand nothing; the publish rule
-        already puts followers in that file's directory."""
+        already puts the group in that file's directory."""
         row = self.current()
         if row is None:
             return
@@ -1795,7 +1775,7 @@ class Navigateur:
 
         published_dir(), deliberately, and not row.path the way open_it() does:
         `o` opens the highlighted *file*, but a shell can only cd to a
-        directory, so this is the same "where am I" rule the followers and
+        directory, so this is the same "where am I" rule the other members and
         $NAV_LASTDIR use.
 
         Every unsupported case sets a message and returns. This key must never
@@ -2248,19 +2228,17 @@ class Navigateur:
         self.top = max(0, min(self.top, max(0, len(self.rows) - body_h)))
 
     def _title_line(self, inner: int) -> str:
-        """The top border: the role flag, and the root path elided from the
+        """The top border: the group badge, and the root path elided from the
         LEFT -- the tail of a path is the informative half -- so that the title
         can never widen the box."""
         c = self.colors
-        border, dim, accent = fg(c["border"]), fg(c["dim"]), fg(c["accent"])
-        # Named groups are shown, the default one is not: the browser is
-        # otherwise the one place that cannot say which group you are in, and
-        # `room` below is derived from len(flag), so the box still cannot widen.
-        tag = "" if self.group == DEFAULT_GROUP else " " + self.group
-        if self.role == "leader":
-            flag, flag_fg = " leading" + tag + " ", accent
-        elif self.role == "follower":
-            flag, flag_fg = " following" + tag + " ", dim
+        border, accent = fg(c["border"]), fg(c["accent"])
+        # A named group is badged, the default group and solo are not: the
+        # browser is otherwise the one place that cannot say which group you
+        # are in, and `room` below is derived from len(flag), so the box still
+        # cannot widen.
+        if self.group and self.group != DEFAULT_GROUP:
+            flag, flag_fg = " " + self.group + " ", accent
         else:
             flag, flag_fg = "", ""
         room = inner - 3 - len(flag)
@@ -2929,14 +2907,14 @@ class Navigateur:
         while True:
             cols, height = screen.measure()
             screen.paint(self.frame(cols, height))
-            # A follower wakes up on its own to check on the leader;
-            # everybody else blocks on the keyboard the way they always did.
-            key = screen.key(0.2 if self.role == "follower" else None)
+            # A group member wakes on its own to catch the others' broadcasts;
+            # a solo window blocks on the keyboard the way it always did.
+            key = screen.key(0.2 if self.group is not None else None)
             if key is None:
                 # Poll *before* looping, or this is a 5Hz spin on measure()'s
                 # ioctl with nothing to show for it.
-                if self.role == "follower":
-                    self.sync_from_leader()
+                if self.group is not None:
+                    self.sync_from_group()
                 continue
             had_message = bool(self.message)
             self.message = ""
@@ -3023,29 +3001,20 @@ class Navigateur:
             elif action in ("panel_keys", "panel_settings"):
                 self.mode = "keys" if action == "panel_keys" else "settings"
                 self.panel_top = self.panel_cursor = 0
-            elif action == "lead":
-                if self.role == "leader":
-                    if self.set_role("solo"):
-                        self.message = "stopped leading"
-                elif self.set_role("leader"):
-                    self.message = ("leading group " + self.group
-                                    + " — its followers track this window")
-            elif action == "follow":
-                if self.role == "follower":
-                    if self.set_role("solo"):
-                        self.message = "stopped following"
-                elif find_leader(self.me, self.group or DEFAULT_GROUP) is None:
-                    # Promotion only. The role file is shared with the shell, so
-                    # an unguarded `f` would recreate the leaderless follower
-                    # `n follow` now refuses. A message and a return, never a
-                    # raise: these keys must not be the ones that kill the
-                    # browser.
-                    self.message = ("no leader for group "
-                                    + (self.group or DEFAULT_GROUP)
-                                    + " — press F in the window that should lead")
-                elif self.set_role("follower"):
-                    self.message = "following the leader of group " + self.group
-                    self.sync_from_leader(force=True)  # `f` means "sync me now"
+            elif action == "group":
+                # One toggle: leave the group this window is in, or join one.
+                # A solo `f` rejoins the group last left (self.last_group), or
+                # `default` on a first join -- nav.zsh's _NAV_LASTGROUP is not
+                # visible here, so this is its analogue.
+                if self.group is not None:
+                    left = self.group
+                    if self.join_group(None):
+                        self.message = "left group " + left
+                else:
+                    target = self.last_group or DEFAULT_GROUP
+                    if self.join_group(target):
+                        self.message = "joined group " + self.group
+                        self.sync_from_group(force=True)  # `f` means "sync now"
             elif action == "bookmark_set":
                 slot = self.read_slot(screen, cols, height,
                                        "bookmark: press a digit 0-9")

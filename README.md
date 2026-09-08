@@ -1,19 +1,22 @@
 # navigateur
 
 A file explorer that lives in your terminal. An expanding tree like the VSCode
-sidebar, `hjkl` to move, colours you set in hex — and one window can take the
-lead and drag your *other* terminals along with it.
+sidebar, `hjkl` to move, colours you set in hex — and terminals that can join a
+**group** and all move together, wherever any one of them goes.
 
 ```
-╭─ ~/Desktop/navigateur   leading ────────╮
+╭─ ~/Desktop/navigateur   3 ──────────────╮
 │   ▾ src/                                │
 │ ❯     nav.py                            │
 │       nav.zsh                           │
 │     README.md                           │
 │     start.txt                           │
 ╰─────────────────────────────────────────╯
-  hjkl move · F lead · f follow · q quit
+  hjkl move · ? keys · ↵ read/open/cd · q quit
 ```
+
+The badge after the path — `3` above — is the group this window is in; solo
+windows and the `default` group show nothing there.
 
 Stdlib-only Python 3 + zsh. No dependencies, no build step. macOS and Linux,
 including over ssh.
@@ -108,45 +111,44 @@ For `w` and `t`, "this folder" means the nearest enclosing directory — on a
 file you get its folder, not an error. Which terminals this works with is the
 one genuinely uneven part of the tool; see [Limitations](#limitations).
 
-### 5. Make your other terminals follow this one
+### 5. Join a group and move together
 
-One window **leads**, the others **follow** its current directory:
+Windows that share a **group** all sit in the same directory. There is no
+leader: whenever *any* member `cd`s — by hand, or with `↵` in the browser —
+every other member follows.
 
 ```sh
-# in the window that should drive:
-navigate lead
-# in every window that should tag along:
-navigate follow
+navigate 3          # join group 3; run it again to leave
+navigate 7          # switch this window to group 7
+navigate solo       # leave whatever group this window is in
+navigate status     # every group, its members, its live count
 ```
 
-From then on the followers go wherever the leader goes — when you `cd` by hand,
-when you press `↵` in the browser, and **live while you browse**. A follower
-that is itself running `navigate` doesn't just move its shell: its tree expands
-out to the leader's directory while you watch.
+`navigate 3` and `navigate 7` are shortcuts for `navigate group 3` /
+`navigate group 7`; a name works too — `navigate group work`. A group name is
+up to 32 characters of letters, digits, `-` and `_`. Running the join for the
+group you are already in **leaves** it, so the digit is a toggle. (A directory
+literally named `3` is still browsable as `navigate ./3` — a bare run of digits
+is always read as a group.)
 
-While you browse, "where the leader is" is the highlighted row's nearest
+Joining adopts the group's current directory. From then on every member's move
+pulls the rest along, **live while you browse**: a member that is itself
+running `navigate` doesn't just move its shell — its tree expands out to the
+new directory while you watch.
+
+While you browse, "where the group is" is the highlighted row's nearest
 enclosing directory, so arrowing between two files in one folder moves nobody.
-That is a preview: quitting with **`q` snaps the followers back** to the
-leader's real directory, while `↵` takes the leader there too.
+That is a preview: quitting with **`q` snaps the others back** to your shell's
+real directory, while `↵` on a folder takes the whole group there.
 
-There is exactly **one leader per group**, and pressing `F` in a second window
-takes the lead away from the first — you never demote anyone by hand. The role
-belongs to the *window*: it survives quitting the browser and lasts until you
-change it or close the terminal.
+Membership belongs to the *window*: it survives quitting the browser and lasts
+until you leave the group or close the terminal. Groups are independent — group
+`3` can't see group `7`, each has its own members and its own broadcasts — and
+a window is in one group at a time.
 
-**Groups** give you several independent sets of this at once. Add a name and
-group `3` can't see group `7` — its own leader, its own followers, its own
-broadcasts:
-
-```sh
-navigate lead 3          # this window leads group 3
-navigate follow 3        # this window follows group 3
-navigate status          # every group, its leader, its subscriber count
-```
-
-Leaving the name off means **the group this window is already in** (`default`
-if it has never joined one), so `navigate lead` in a window already leading
-group 3 is a no-op rather than a move. You are in one group at a time.
+If two members `cd` at the very same moment, before either shell has drawn its
+next prompt, there is no tie-breaker: each ends up where it put itself and the
+group is split until somebody moves again.
 
 ---
 
@@ -215,8 +217,7 @@ what the `source` line in your `.zshrc` is for.
 | `x` | cut everything marked into the current folder — the same operation as move, under its own key; does nothing if nothing is marked |
 | `d` | delete everything marked, asking `y`/`N` per item (`Y` = all the rest); does nothing if nothing is marked |
 | `e` | mark/unmark the current row — any time, no mode |
-| `F` | **lead** this window's group — its followers track this window |
-| `f` | **follow** this window's group — refused if nobody is leading it |
+| `f` | **join or leave this window's group** — joins `default` when solo, rejoins the last group you left, or leaves the one you're in |
 | `?` | the full key table, laid out and grouped |
 | `,` | settings: your colours, your keys, your bookmarks |
 | `↵` | **on a folder**: quit and cd your shell here. **On a `.md`**: read it in the browser (see *Reading markdown*). **On any other file**: open it (see *Opening a file with `↵`*), staying in the browser |
@@ -247,9 +248,10 @@ there and closes the panel), `Esc` backs out one level — submenu → menu →
 browser. **`q` still quits the browser outright, from inside a panel as
 everywhere else**; it is the one key here that never means anything else.
 
-`F` and `f` toggle: pressing either again returns the window to solo. They
-take no argument, so they act on the group the window is already in — they
-never yank you back to `default`.
+`f` toggles: press it in a grouped window to go solo, press it again to rejoin
+the group you just left. A solo window that has never joined one gets
+`default`. It takes no argument — it acts on the group this window is already
+in, or the last one it was in.
 
 Mark first, then act. `e` marks or unmarks the current row at any time — no
 mode to enter — and you can navigate freely between marks, expanding,
@@ -287,8 +289,9 @@ Unbound keys do nothing — **except escape sequences**: only the four arrows ar
 decoded, so PageUp, Home, End, the function keys and modified arrows all arrive
 as `Esc` and quit the browser.
 
-Bookmarks are ten shared slots. They are **not** per-terminal like roles — set
-one in any window, and every window (and every future session) can jump to it.
+Bookmarks are ten shared slots. They are **not** per-terminal like group
+membership — set one in any window, and every window (and every future
+session) can jump to it.
 
 ---
 
@@ -300,40 +303,32 @@ All three names are the same function: `navigate`, `nav`, `n`.
 |---|---|
 | `navigate` | open the browser here |
 | `navigate ~/projects` | open it rooted there |
-| `navigate lead [group]` | this window leads (`leader` is an alias) |
-| `navigate follow [group]` | this window follows (`follower` is an alias) |
-| `navigate solo` | give up whatever role this window had |
-| `navigate status [group]` | who leads each group, and how many follow |
+| `navigate 3` | join group `3` — toggles out if this window is already in it |
+| `navigate group work` | join the group named `work` — same toggle |
+| `navigate solo` | leave whatever group this window is in |
+| `navigate status [group]` | every group, its members, its live count |
 
-The older spellings still work and mean the same thing:
-`navigate follow on|off|toggle|status`, with an optional group after them —
-`navigate follow on 3`.
+`navigate 3` is shorthand for `navigate group 3`; only a bare run of digits
+gets the shorthand, so `navigate ./3` still browses a directory named `3`.
 
-Each of these prints what the window ended up as, including whether a follower
-got **live** or **lazy** delivery:
-
-```
-navigateur: leading group default (-dev-ttys003) · its followers track this window
-navigateur: following group default (-dev-ttys004) · live
-navigateur: solo (-dev-ttys005)
-```
-
-**Following needs somebody to follow.** With no leader for that group,
-`navigate follow` changes nothing and exits 2:
+Each of these prints what the window ended up as, including whether it got
+**live** or **lazy** delivery:
 
 ```
-navigateur: no leader for group default — run `n lead default` in the window that should lead
+navigateur: in group default (ttys003) · live
+navigateur: in group 3 (ttys004) · lazy (moves on your next prompt)
+navigateur: solo (ttys005)
 ```
 
-That is deliberate — the alternative is a follower that will never move. `f` in
-the browser says the same. A window that is *itself* the leader gets the same
-refusal, so it can never leave a group with nobody leading.
+There is no leader and nothing to refuse: joining a group always succeeds and
+the window adopts the group's current directory (or seeds it, if nobody has
+moved yet). Every member both broadcasts and follows.
 
 A group name is up to 32 characters of letters, digits, `-` and `_` — it becomes
-a directory under `~/.navigateur/groups/`, so `navigate lead ../elsewhere` is
-refused. Naming a group is all it takes to create one; nothing removes one, so a
-group that has broadcast once keeps appearing in `navigate status` as
-`leader none` after everybody has left.
+a directory under `~/.navigateur/groups/`, so `navigate group ../elsewhere` is
+refused. Joining a group is all it takes to create one; nothing removes one, so
+a group that has broadcast once keeps appearing in `navigate status` with `0
+member(s)` after everybody has left.
 
 ---
 
@@ -399,7 +394,7 @@ On Linux all four check `$DISPLAY`/`$WAYLAND_DISPLAY` and say `no display`
 when there is none — the usual case over ssh to a server. The browser itself
 is unaffected.
 
-### Live vs lazy following
+### Live vs lazy delivery
 
 | | |
 |---|---|
@@ -407,25 +402,32 @@ is unaffected.
 | **lazy** | it catches up the next time you press Enter |
 
 Lazy is the automatic fallback when `zle` or the `zsh/system` module isn't
-available; it costs immediacy and nothing else. `navigate follow` tells you
-which one that terminal got — including **in Warp, where it is unverified**,
-since `zle -F` needs a live prompt and can't be tested from a script.
+available; it costs immediacy and nothing else. Joining a group tells you which
+one that terminal got — including **in Warp, where it is unverified**, since
+`zle -F` needs a live prompt and can't be tested from a script.
 
-`navigate status` counts only *live* subscribers, so `0 live-subscribed` while
-someone is following is normal, not a fault.
+`navigate status` counts a group's `live` members separately from its total, so
+`1 member(s), 0 live` for a lazy window is normal, not a fault.
 
-### Following is per machine
+### Two members moving at once
+
+There is no total order across the group. If two members `cd` in the same
+prompt gap — before either shell reconciles — each keeps its own directory and
+the group stays split until somebody moves again. Common enough to name, rare
+enough in practice to leave as is: one more move reconverges everyone.
+
+### Groups are per machine
 
 The shared state is a directory on disk. Two ssh sessions into the same box
-follow each other, but a terminal on your Mac can never lead one on that box —
-different filesystems, no shared seam.
+move together, but a terminal on your Mac can never share a group with one on
+that box — different filesystems, no shared seam.
 
 ### Windows that die without cleaning up
 
 A terminal closed without `navigate solo` cleans itself up on the next
-broadcast. One that is *killed* outright leaves its role behind until that
-terminal name is reused, at which point the stale role is dropped rather than
-inherited.
+broadcast. One that is *killed* outright leaves its group membership behind
+until that terminal name is reused, at which point the stale file is dropped
+rather than inherited.
 
 ---
 
@@ -448,8 +450,8 @@ border      = "#504945"
 selected_bg = "#3c3836"
 
 [behavior]
-show_hidden    = false
-follow_default = false   # start this window as the leader
+show_hidden   = false
+group_default = false   # join the `default` group on every launch
 
 [keys]
 down           = "j"     # ... one line per action, see `?`
@@ -478,10 +480,11 @@ one falls back to its default rather than taking the section down with it:
 Colours are editable the same way (`,` → **colours**, `↵`, type `#rrggbb`) and
 apply immediately — no relaunch.
 
-`follow_default = true` is the **leader** side despite its name: it opens every
-browser session as if you had pressed `F`, taking the lead of `default`. It
-makes nothing *follow* — that is still `f` / `navigate follow`, per window — and
-a role you have already set wins over it.
+`group_default = true` opens every browser session already in the `default`
+group, as if you had pressed `f` on launch. A window that is already in a group
+keeps that group. (This key was called `follow_default` before groups went
+leaderless; an old `follow_default = true` is silently ignored — set
+`group_default` instead.)
 
 ---
 
@@ -491,18 +494,22 @@ a role you have already set wins over it.
 |---|---|
 | `install.sh` | writes the `source` line into your `.zshrc`; `--uninstall` removes it |
 | `src/nav.py` | the browser |
-| `src/nav.zsh` | the `nav()` function, follow subscription, prompt hooks |
-| `~/.navigateur/` | `config.toml`, `roles/<tty>`, `groups/<group>/{cwd,sub/<tty>.fifo}`, `bookmarks/<digit>` |
+| `src/nav.zsh` | the `nav()` function, group subscription, prompt hooks |
+| `~/.navigateur/` | `config.toml`, `roles/<tty>` (this window's group), `groups/<group>/{cwd,gen,sub/<tty>.fifo}`, `bookmarks/<digit>` |
 
 Set `$NAV_STATE` before sourcing `nav.zsh` to move all of that elsewhere —
-useful for keeping two installs from sharing roles, groups and bookmarks.
+useful for keeping two installs from sharing groups and bookmarks.
 Deleting `~/.navigateur` returns everything to first-run state.
 `$NAV_TERMINAL` overrides terminal detection on Linux (see above).
 
-**Upgrading from a version without groups:** your role files still read
-correctly (they are taken as group `default`), but the broadcast files moved
-under `groups/`, so a window that was **already following** needs one
-`navigate follow` to re-subscribe.
+**Upgrading from leader/follower:** a `roles/<tty>` file that still says
+`leader 3` or `follower default` is read as plain membership of that group —
+the role word is dropped — so a fresh shell picks the group up on its first
+prompt and starts moving with it, no action needed. A window that was a *live
+follower* and only re-`source`s `nav.zsh` mid-session (rather than starting a
+new shell) may stay lazy until you run `navigate <group>` once. The same nudge
+covers the older groups upgrade, where the broadcast files first moved under
+`groups/`.
 
 ---
 
