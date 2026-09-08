@@ -137,6 +137,15 @@ Consequences that are easy to undo by accident:
   by setting `self.published = str(self.published_dir())` right after `reveal_path()` —
   `published_dir()`, not `dest`, because the two can differ by normalisation and
   `maybe_publish()` compares against `published_dir()`.
+  **The `gen` stamp is recorded on send too, not just receive.** `_nav_precmd`'s own-move
+  branch and `nav()`'s snap-back both do `_NAV_SEEN=$(_nav_msg …)` right after
+  `_nav_publish`; `maybe_publish()` must likewise set `self.seen = read_msg(target, …)`
+  right after `publish()`. `publish()` stamps a fresh `gen` every call, so a send that
+  skipped this reads its *own* broadcast back on the next `sync_from_group()` poll
+  (`msg != self.seen`) and `reveal_path()`s into it — and because a folder the cursor has
+  merely moved onto is still collapsed, the "already there" guard's `is_open(target)` clause
+  misses and the folder **expands under you**. That was the bug; leave the guard alone and
+  keep the send-path record.
 - **`_nav_precmd`'s three-way order lets a member's own `cd` win a race.** Keyed on
   `_NAV_AT`: **unset** → fresh join, adopt `groups/<g>/cwd` if it exists (record
   `_NAV_SEEN`, set `_NAV_AT`), else seed the group with `$PWD`; **`$PWD != $_NAV_AT`** →

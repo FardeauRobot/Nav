@@ -1425,6 +1425,14 @@ class Navigateur:
             return  # de-dupe: arrowing between sibling files must not re-fire
         self.published = target
         publish(Path(target), self.me, self.group)
+        # Record the stamp we just wrote as seen, exactly as _nav_precmd's
+        # own-move branch does (`_NAV_SEEN=$(_nav_msg ...)` right after
+        # `_nav_publish`, nav.zsh). publish() has just stamped a fresh gen, so
+        # without this sync_from_group() reads our own broadcast back 200ms
+        # later, finds msg != self.seen, and -- because a folder the cursor
+        # merely moved onto is still collapsed, so line 1473's is_open() guard
+        # misses -- reveal_path()s into it and expands it under you.
+        self.seen = read_msg(target, self.group)
 
     def select_path(self, path: Path) -> None:
         for i, row in enumerate(self.rows):
