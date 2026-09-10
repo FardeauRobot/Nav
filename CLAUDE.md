@@ -234,9 +234,16 @@ cursor and must not silently change what `↵` will confirm.
 move/copy/cut/delete confirmed here too — but the verb keys `m`/`c`/`x`/`d` now run their
 own confirm the moment they are pressed, so there is nothing left for `↵` to confirm; see
 "Move/copy/cut/delete".) `open_file()` routes on `row.path.suffix.lower()` against
-`MD_SUFFIXES` / `EDIT_SUFFIXES` / `EDIT_NAMES` (module level, next to `LINUX_TERMINALS`) and
-falls through to `open_it()` for everything else — so the desktop handoff stays the single
-default rather than being reimplemented.
+`MD_SUFFIXES` / `PDF_SUFFIXES` / `EDIT_SUFFIXES` / `EDIT_NAMES` (module level, next to
+`LINUX_TERMINALS`) and falls through to `open_it()` for everything else — so the desktop
+handoff stays the single default rather than being reimplemented.
+
+- **`PDF_SUFFIXES` → `_run_viewer()` is an integration, unlike the reader.** It runs the
+  external `lecteur` (`~/PDFinTerminal`, Rust) on the same `suspend()`/`resume()` loan as
+  `_run_editor()`. Lookup is `shutil.which` then `~/.cargo/bin/lecteur` (not on `$PATH` on
+  the Mac); missing → `open_it()`, so `↵` never dead-ends. lecteur's stdout (lines staged
+  with `Y`) is **captured**, not inherited: `resume()` would repaint over it. It goes to the
+  clipboard and the message line.
 
 - **The `root_selected` gate is the whole subtlety.** `published_dir()` deliberately ignores
   the row in the window after a `reveal_path()` teleport, because `self.root` is structurally

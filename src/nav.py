@@ -13,6 +13,7 @@ shell function cds there afterwards. stdout is the display, never a channel.
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import os
 import select
@@ -21,6 +22,7 @@ import signal
 import subprocess
 import sys
 import shlex
+import tempfile
 import re
 import termios
 import time
@@ -165,7 +167,7 @@ KEY_SECTIONS: list[tuple[str, list[tuple[str | None, str, str, str]]]] = [
         ("collapse_all", "=", "", "collapse everything to the root"),
         ("top", "g", "", "first row"),
         ("bottom", "G", "", "last row"),
-        (None, "↵", "", "read a .md, open a file, or cd here and quit"),
+        (None, "↵", "", "read a .md or .pdf, open a file, or cd here and quit"),
     ]),
     ("opening", [
         ("open", "o", "", "open in the default app"),
@@ -506,6 +508,9 @@ def launch_detached(args: list[str], cwd: str | None = None) -> None:
 # in every terminal, which is exactly what makes it a routing rule and not an
 # integration with something else that happens to be installed.
 MD_SUFFIXES = frozenset({".md", ".markdown", ".mdown"})
+# PDF_SUFFIXES means "lecteur in this terminal, if it is installed" -- unlike
+# the reader this *is* an integration, so it degrades to open_it() without it.
+PDF_SUFFIXES = frozenset({".pdf"})
 EDIT_SUFFIXES = frozenset({
     ".c", ".h", ".cc", ".cpp", ".cxx", ".c++", ".hpp", ".hh", ".hxx",
     ".py", ".rs", ".go", ".rb", ".pl", ".lua", ".java", ".swift",
@@ -1755,12 +1760,12 @@ class Navigateur:
             # paths[0] may sit in a collapsed subtree
 
     def open_file(self, row: Row, screen: Screen) -> None:
-        """`↵` on a file. Three routes, decided by extension:
+        """`↵` on a file. Four routes, decided by extension:
 
         markdown opens in the reader, in this frame, on every platform and in
-        every terminal; anything else textual goes to the editor in this
-        terminal; anything else falls through to open_it(), the desktop's
-        default app.
+        every terminal; a PDF goes to lecteur in this terminal when it is
+        installed; anything else textual goes to the editor in this terminal;
+        anything else falls through to open_it(), the desktop's default app.
 
         Markdown used to be handed to `open -a Warp` on the belief that its
         Markdown Viewer would render it -- inferred from the bundle's document
@@ -1773,10 +1778,56 @@ class Navigateur:
         suffix = row.path.suffix.lower()
         if suffix in MD_SUFFIXES:
             self.open_reader(row.path)
+        elif suffix in PDF_SUFFIXES:
+            self._run_viewer(screen, row.path)
         elif suffix in EDIT_SUFFIXES or row.path.name in EDIT_NAMES:
             self._run_editor(screen, [row.path])
         else:
             self.open_it()
+
+    def _run_viewer(self, screen: Screen, path: Path) -> None:
+        """A PDF in lecteur (~/PDFinTerminal), on the same suspend/resume loan
+        _run_editor() takes. Looked up on $PATH, then in ~/.cargo/bin -- where
+        `cargo install` puts it, and which is not on $PATH on this Mac. Not
+        installed means open_it(), so `↵` on a PDF never becomes a dead key.
+
+        Lines staged there with `Y` would go to stdout, where resume() paints
+        over them -- but stdout cannot be captured either, it is where lecteur
+        draws. So they come back through --staged-to, a temp file, and go to
+        the clipboard and the message line."""
+        exe = shutil.which("lecteur")
+        if exe is None:
+            cand = Path.home() / ".cargo" / "bin" / "lecteur"
+            exe = str(cand) if os.access(cand, os.X_OK) else None
+        if exe is None:
+            self.open_it()
+            return
+        fd, tmp = tempfile.mkstemp(prefix="nav-lecteur-", suffix=".txt")
+        os.close(fd)
+        screen.suspend()
+        try:
+            proc = subprocess.run([exe, "--staged-to", tmp, str(path)], check=False)
+            staged = Path(tmp).read_text(errors="replace").strip()
+        except OSError as exc:
+            self.message = f"lecteur failed: {exc}"
+            return
+        finally:
+            screen.resume()
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+        if staged:
+            lines = staged.splitlines()
+            copied = False
+            try:
+                copied = subprocess.run(["pbcopy"] if IS_MAC else ["wl-copy"],
+                                        input=staged, text=True,
+                                        check=False).returncode == 0
+            except OSError:
+                pass
+            self.message = (f"{len(lines)} staged line(s)"
+                            + (" copied to the clipboard" if copied else f": {lines[0]}"))
+        elif proc.returncode != 0:
+            self.message = f"lecteur exited {proc.returncode}"
 
     def spawn_terminal(self, new_window: bool) -> None:
         """w / t -- open a new terminal window or tab already cd'd here.

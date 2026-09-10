@@ -50,7 +50,8 @@ leaves the browser running, routing on the file's extension:
 | --- | --- |
 | `.md`, `.markdown`, `.mdown` | the **reader**, right there in the browser — see below |
 | any source or config file — `.c` `.h` `.cpp` `.py` `.rs` `.go` `.js` `.ts` `.sh` `.zsh` `.toml` `.json` `.yaml` `.txt` and friends, plus `Makefile`, `Dockerfile`, `.zshrc`, `.gitignore`… | your editor, in this terminal — the same handoff `E` uses |
-| anything else — a `.png`, a `.pdf`, a binary | your desktop's default app, exactly as `o` does |
+| `.pdf` | **lecteur** (`~/PDFinTerminal`), in this terminal — real pages, vim keys; lines staged there with `Y` land on your clipboard. Not installed → the desktop app, like anything else |
+| anything else — a `.png`, a binary | your desktop's default app, exactly as `o` does |
 
 The editor is `$VISUAL`, then `$EDITOR`, then `nvim`, then `vim`. A value with
 arguments (`code -w`) works; a GUI editor that returns immediately will just
