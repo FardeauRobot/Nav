@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import getpass
 import os
 import select
 import shutil
@@ -167,7 +168,7 @@ KEY_SECTIONS: list[tuple[str, list[tuple[str | None, str, str, str]]]] = [
         ("collapse_all", "=", "", "collapse everything to the root"),
         ("top", "g", "", "first row"),
         ("bottom", "G", "", "last row"),
-        (None, "↵", "", "read a .md or .pdf, open a file, or cd here and quit"),
+        (None, "↵", "", "read a .md or .pdf, open a file (in a running nvim, if any), or cd here and quit"),
     ]),
     ("opening", [
         ("open", "o", "", "open in the default app"),
@@ -556,6 +557,68 @@ def editor_argv() -> list[str] | None:
         if shutil.which(fallback):
             return [fallback]
     return None
+
+
+def nvim_servers() -> list[tuple[str, Path]]:
+    """Every live nvim on this machine, as (socket, cwd). Each nvim listens on
+    its own socket from startup -- `stdpath('run')/nvim.<pid>.0`, i.e.
+    $XDG_RUNTIME_DIR or $TMPDIR, then `nvim.$USER/<random>/` -- so nothing in
+    the nvim config has to cooperate, and an nvim started before nav existed
+    is found too. Sockets of crashed instances linger; `--remote-expr` on one
+    exits nonzero (connection refused), which is the liveness test."""
+    exe = shutil.which("nvim")
+    if exe is None:
+        return []
+    base = Path(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir())
+    found = []
+    for sock in sorted(base.glob(f"nvim.{getpass.getuser()}/*/nvim.*.0")):
+        try:
+            r = subprocess.run(
+                [exe, "--server", str(sock), "--remote-expr", "getcwd()"],
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=1,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if r.returncode == 0 and r.stdout.strip():
+            found.append((str(sock), Path(r.stdout.strip())))
+    return found
+
+
+def remote_nvim_open(paths: list[Path]) -> Path | None:
+    """`↵` on a source file: open it as a `:vsplit` in an nvim that is already
+    running (typically in another pane), rather than a second nvim here. The
+    session is the one whose cwd is the deepest ancestor of the file, else the
+    only one running; several unrelated ones -> None, and the caller falls
+    back to _run_editor(). Returns the chosen session's cwd on success.
+
+    `--remote-expr "execute(...)"`, not `--remote-send`: send injects keys
+    into the UI's input queue, so it depends on the remote's mode and can land
+    in the middle of an insert. execute() runs the Ex command directly. The
+    path goes through fnameescape() inside a '...' Vimscript string, where a
+    literal `'` is escaped by doubling it."""
+    servers = nvim_servers()
+    target = paths[0].resolve()
+    fits = [s for s in servers if target.is_relative_to(s[1])]
+    if fits:
+        sock, cwd = max(fits, key=lambda s: len(s[1].parts))
+    elif len(servers) == 1:
+        sock, cwd = servers[0]
+    else:
+        return None
+    for p in paths:
+        quoted = str(p.resolve()).replace("'", "''")
+        try:
+            r = subprocess.run(
+                [shutil.which("nvim") or "nvim", "--server", sock, "--remote-expr",
+                 f"execute('vsplit ' .. fnameescape('{quoted}'))"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=2,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if r.returncode != 0:
+            return None
+    return cwd
 
 
 # --------------------------------------------------------------------- markdown
@@ -1764,8 +1827,11 @@ class Navigateur:
 
         markdown opens in the reader, in this frame, on every platform and in
         every terminal; a PDF goes to lecteur in this terminal when it is
-        installed; anything else textual goes to the editor in this terminal;
-        anything else falls through to open_it(), the desktop's default app.
+        installed; anything else textual goes to a running nvim as a vsplit
+        when remote_nvim_open() finds one, else to the editor in this
+        terminal; anything else falls through to open_it(), the desktop's
+        default app. `E` never takes the remote route -- it is how you still
+        edit right here.
 
         Markdown used to be handed to `open -a Warp` on the belief that its
         Markdown Viewer would render it -- inferred from the bundle's document
@@ -1781,7 +1847,11 @@ class Navigateur:
         elif suffix in PDF_SUFFIXES:
             self._run_viewer(screen, row.path)
         elif suffix in EDIT_SUFFIXES or row.path.name in EDIT_NAMES:
-            self._run_editor(screen, [row.path])
+            cwd = remote_nvim_open([row.path])
+            if cwd is not None:
+                self.message = f"opened {row.path.name} in nvim ({cwd.name or cwd})"
+            else:
+                self._run_editor(screen, [row.path])
         else:
             self.open_it()
 

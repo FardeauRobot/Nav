@@ -49,13 +49,20 @@ leaves the browser running, routing on the file's extension:
 | the file | what happens |
 | --- | --- |
 | `.md`, `.markdown`, `.mdown` | the **reader**, right there in the browser — see below |
-| any source or config file — `.c` `.h` `.cpp` `.py` `.rs` `.go` `.js` `.ts` `.sh` `.zsh` `.toml` `.json` `.yaml` `.txt` and friends, plus `Makefile`, `Dockerfile`, `.zshrc`, `.gitignore`… | your editor, in this terminal — the same handoff `E` uses |
+| any source or config file — `.c` `.h` `.cpp` `.py` `.rs` `.go` `.js` `.ts` `.sh` `.zsh` `.toml` `.json` `.yaml` `.txt` and friends, plus `Makefile`, `Dockerfile`, `.zshrc`, `.gitignore`… | a running nvim, as a vertical split (see below) — else your editor, in this terminal, the same handoff `E` uses |
 | `.pdf` | **lecteur** (`~/PDFinTerminal`), in this terminal — real pages, vim keys; lines staged there with `Y` land on your clipboard. Not installed → the desktop app, like anything else |
 | anything else — a `.png`, a binary | your desktop's default app, exactly as `o` does |
 
 The editor is `$VISUAL`, then `$EDITOR`, then `nvim`, then `vim`. A value with
 arguments (`code -w`) works; a GUI editor that returns immediately will just
 flicker the screen, so give it its wait flag.
+
+**Reusing a running nvim.** If nvim is already open — say in the pane next to
+`nav` — `↵` on a source file opens it there as a `:vsplit` instead of starting a
+second nvim. It picks the nvim whose working directory contains the file (the
+deepest one if several do), or the only nvim running. Several unrelated ones,
+or none, and it falls back to your editor in this terminal. Nothing to
+configure: every nvim already listens on its own socket. `E` always edits here.
 
 `E` in the tree opens every **marked** file at once (mark with `e`) — under
 `nvim`/`vim` they open in split windows (`-o`), any other editor just gets the

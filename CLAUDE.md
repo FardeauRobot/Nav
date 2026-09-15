@@ -267,6 +267,15 @@ handoff stays the single default rather than being reimplemented.
   else. `select_path()` runs only for the single-path case; a multi-open leaves the cursor
   put. `E` does **not** clear the marks — they are a pending copy/move batch it is only
   previewing.
+- **`↵` on a source file tries `remote_nvim_open()` first; `E` never does.** It opens a
+  `:vsplit` in an nvim already running in another pane. `nvim_servers()` finds them by
+  globbing nvim's *default* per-instance sockets (`stdpath('run')/nvim.<pid>.0`), which
+  every nvim has with no config involved — do not go back to a fixed shared socket from
+  init.lua: the `serverstart`/`os.remove` retry that required let each new nvim delete the
+  previous one's socket, and the feature silently never fired. Dead sockets are filtered by
+  `--remote-expr` exiting nonzero. It is `--remote-expr "execute(...)"`, not `--remote-send`,
+  so it doesn't depend on the remote's mode. No match → `None` → `_run_editor()`, so `↵`
+  never dead-ends.
 - **`_run_editor()` uses `Screen.suspend()`/`resume()`, never `restore()`** — see that
   section under Cross-file invariants. It is the same loan `E` always took.
 - **`MD_SUFFIXES` means "the reader", unconditionally.** An earlier pass routed markdown to
