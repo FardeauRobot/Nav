@@ -541,8 +541,8 @@ Each of these looks like removable noise and is load-bearing:
 
 Everything else `nav.py` writes is bookkeeping under `$NAV_STATE` — bookmarks, roles, group
 `cwd` files. `do_move()`/`do_copy()`/`try_delete()` are the only places the browser changes
-what it is showing you, via `shutil.move()`/`shutil.copy2()`/`shutil.copytree()`/
-`shutil.rmtree()`/`Path.unlink()`, and the invariants below exist because a mistake here loses
+what it is showing you, via `shutil.move()`/`shutil.copytree()`/`copy_with_progress()`/
+`remove_with_progress()`/`Path.unlink()`, and the invariants below exist because a mistake here loses
 a user's files rather than corrupting a scratch file that a restart repairs.
 
 **`self.marked` is the only op state — a free-standing selection, not a mode.** `e`
@@ -610,9 +610,13 @@ at the user's request: mark first, then act.
   is `_op_batch()`'s nested-mark-collapse step alone, deliberately not a call to `_op_batch()`
   with a fake destination, since delete has no destination and none of `_op_batch()`'s
   collision/lexists checks apply. Symlink handling: `p.is_dir() and not p.is_symlink()` routes
-  to `shutil.rmtree()`, else `p.unlink()` — `shutil.rmtree()` itself refuses to operate on a
-  symlink, and `rm` semantics (remove the link, never dereference into its target) is the
-  correct and expected behavior for an irreversible delete.
+  to `remove_with_progress()`, else `p.unlink()` — `rm` semantics (remove the link, never
+  dereference into its target) is the correct and expected behavior for an irreversible delete.
+  `remove_with_progress()` replaced `shutil.rmtree()` only because rmtree has no per-file hook;
+  its one trap is that `os.walk(followlinks=False)` does not *descend* a symlinked folder but
+  still *lists* it in `dirs`, so every entry there is `islink()`-checked and unlinked rather
+  than `rmdir`'d. Its `onerror` re-raises, so an unreadable subfolder is reported instead of
+  silently skipped and surfacing later as "directory not empty".
 - **The collision preflight is all-or-nothing, checked before any `shutil.move`/`shutil.copy2`/
   `shutil.copytree` call runs.** `_op_batch()` walks the whole batch — nested-mark collapse,
   duplicate basenames *within the batch itself* (two marked files that happen to share a name
@@ -633,8 +637,9 @@ at the user's request: mark first, then act.
   it yourself risks falling through to a raw rename that silently replaces whatever the
   preflight above just checked for. `shutil.move` also degrades across filesystems, which a
   bare rename does not.
-- **`shutil.copytree` needs the joined destination path; `shutil.copy2` needs the bare
-  directory — `do_copy()`'s `p.is_dir()` branch exists only because of this asymmetry.**
+- **`shutil.copytree` needs the joined destination path; `copy_with_progress()` (copy2's
+  convention) takes the bare directory — `do_copy()`'s `p.is_dir()` branch exists only because
+  of this asymmetry.**
   Unlike `shutil.move`/`shutil.copy2`, `copytree` refuses an existing target directory rather
   than resolving the join itself (the collision preflight already guarantees the target doesn't
   exist, so that refusal never actually fires — the asymmetry is still real and would silently
@@ -645,6 +650,45 @@ at the user's request: mark first, then act.
   `shutil.move` relocates a symlink as a symlink. This is the stdlib default, left as-is rather
   than passed `symlinks=True`/`follow_symlinks=False`; if that turns out to be the wrong call,
   it is a deliberate flag flip here, not a bug to rediscover.
+- **Copy and delete report progress on the hint line, synchronously.** `Progress` repaints
+  through the normal `frame()`/`paint()` path from inside the work (throttled to ~10Hz,
+  `measure()` each time so a resize still takes) — no thread, so ctrl-c's `KeyboardInterrupt`
+  still lands where it always did. The text is `progress_text()`'s plain `#`/`-` bar, not
+  styled, because `_hint_line()` slices `self.message` by `len()` and would cut an escape in
+  half; the name is dropped first and the numbers last. Counting happens *after* the `y`, never
+  before a prompt: copy counts the whole batch in bytes (so one 4 GB file still moves), delete
+  counts each folder in entries once that item is confirmed. Only files ≥ `CHUNKED_FROM` are
+  chunk-copied (then `copystat`, opened `"xb"`); smaller ones go through plain `copy2` to keep
+  macOS's `fcopyfile` path; a chunked copy that fails or is ctrl-c'd unlinks its own
+  half-written file (safe *because* of `"xb"`), so a failed `copy2`-or-chunked copy still
+  leaves the one file either copied or not. `Progress.tick()` swallows any repaint error — the
+  caller's `except OSError` is about the disk, and a paint must never abort a half-done delete.
+  `Progress.finish()` `tcflush`es the keys typed while the bar ran, `resume()`'s reason: for a
+  delete it runs before the next item's `y`/`N`, which a queued `y` would otherwise answer
+  unseen. Move is not covered: a same-filesystem `shutil.move` is a rename,
+  and the cross-filesystem case still freezes.
+- **Esc cancels a copy, and only a copy.** `Progress(cancellable=True)` polls `screen.key(0)`
+  inside `tick()` at the repaint rate — *outside* the repaint's `except Exception`, which would
+  swallow it — and raises `CopyCancelled`. That class is deliberately **not** an `OSError`/
+  `shutil.Error`: `copytree` catches those per entry, keeps walking and raises one combined
+  error at the end. `do_copy()` catches it and `remove_path()`s `dest/<name>` for every item up
+  to and including the current one — safe because the preflight proved none existed before the
+  `y` — then keeps the marks (try_op's cancel rule; leftover copies would trip the collision
+  preflight on the retry). The counting pass ticks too, so an Esc there cancels with nothing
+  written. Delete stays non-cancellable: nothing to roll back, and `try_delete()` only catches
+  `OSError`, so a raise there would quit the browser.
+- **`^z` is undo, which needed the terminal's help.** `tty.setcbreak` keeps `ISIG`, so `^z`
+  sent SIGTSTP and stopped the process on the alt screen. `Screen._cbreak()` (used by both
+  `__enter__` and `resume()`) disables only `VSUSP`, with `os.fpathconf(fd, "PC_VDISABLE")` —
+  0xff on macOS, 0 on Linux, never hardcode it — so `^c` still raises `KeyboardInterrupt` and
+  `suspend()` (which restores `saved`) still hands nvim a working `^z`. `self.undo` is an
+  in-process stack pushed only with what *succeeded* (a partial "moved N of M" records the N):
+  `("move", [(now, was)])` for move/cut/rename, `("copy"|"new", [paths])`, and a bare
+  `("delete", [])` marker so `^z` reports "can't" instead of silently undoing something older
+  — it pops on that report, so the next press reaches the one before. `undo_last()` prechecks
+  the whole entry before touching anything and leaves it on the stack on a refusal. Only the
+  copy undo asks `y` (it deletes data that may have been edited since); a new file goes only
+  while still 0 bytes.
 - **A destination inside a marked folder is refused, not attempted.** Moving/copying/cutting a
   folder into its own descendant is checked with `Path.is_relative_to` before anything happens,
   and the refusal (`_op_batch` → `None`) keeps `self.marked` intact so the user can just pick a

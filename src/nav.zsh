@@ -222,7 +222,10 @@ _nav_follow_start() {
   # read the same state, so degrading costs only immediacy.
   if [[ -o interactive ]]; then
     [[ -p $_NAV_FIFO ]] || mkfifo -m 600 -- $_NAV_FIFO 2>/dev/null
-    if [[ -p $_NAV_FIFO ]] && exec {_NAV_FD}<>$_NAV_FIFO 2>/dev/null; then
+    # The braces scope 2>/dev/null to this one open. A bare `exec {fd}<>f
+    # 2>/dev/null` applies *every* redirection to the shell for good, so stderr
+    # stayed on /dev/null in every following window.
+    if [[ -p $_NAV_FIFO ]] && { exec {_NAV_FD}<>$_NAV_FIFO } 2>/dev/null; then
       zle -F $_NAV_FD _nav_reader 2>/dev/null || {
         exec {_NAV_FD}>&-; unset _NAV_FD; rm -f -- $_NAV_FIFO
       }

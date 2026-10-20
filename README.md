@@ -229,6 +229,7 @@ what the `source` line in your `.zshrc` is for.
 | `?` | the full key table, laid out and grouped |
 | `,` | settings: your colours, your keys, your bookmarks |
 | `↵` | **on a folder**: quit and cd your shell here. **On a `.md`**: read it in the browser (see *Reading markdown*). **On any other file**: open it (see *Opening a file with `↵`*), staying in the browser |
+| `Ctrl-Z` | undo the last move, cut, copy, rename or new file (see below) |
 | `q` or `Esc` | quit, leaving your shell where it was — `Esc` instead drops your marks if you have any, or closes a panel, without quitting |
 | `Ctrl-C` / `Ctrl-D` | quit, same as `q` |
 
@@ -285,6 +286,24 @@ file you didn't mean to is worse than a stray move, so each one gets its own
 chance to say no. Press `Y` instead of `y` on any item to delete it and
 everything still left in the batch without asking again. Anything other than
 `y`/`Y` stops there.
+
+A copy, or the deletion of a folder, shows its progress on the bottom line
+while it runs — a short counting pass first, then a bar with the percentage,
+the size (bytes for a copy, entries for a delete) and the file in hand. A move
+within the same disk is instant and shows none.
+
+`Esc` during a copy cancels it and takes the **whole batch** back — the items
+already finished included — so nothing is left half-copied and your marks are
+kept for a retry. A delete cannot be cancelled this way (there is nothing to
+put back).
+
+`Ctrl-Z` undoes the last file operation of this session, one step per press:
+a move, cut or rename goes back where it was; a copy deletes the copies (after
+a `y`, since you may have edited them); a new file is removed only if it is
+still empty. A delete can't be undone — `Ctrl-Z` says so, and the next press
+reaches the operation before it. If the way back is blocked (something now
+sits at the old name), nothing is touched and the step stays undoable. The
+history lives only as long as the browser; it is not saved.
 
 Cut and move do the same thing to your files (relocate rather than duplicate);
 `x` exists as its own key/label for people who think in cut-and-paste terms,

@@ -1,0 +1,25 @@
+{
+  "title": "navigateur",
+  "steps": [
+    {
+      "id": "0",
+      "name": "Browser + zsh integration",
+      "state": "done"
+    },
+    {
+      "id": "1",
+      "name": "File operations",
+      "state": "done"
+    },
+    {
+      "id": "2",
+      "name": "Copy/delete progress bar",
+      "state": "done"
+    },
+    {
+      "id": "3",
+      "name": "Esc cancels a copy, ^z undo",
+      "state": "done"
+    }
+  ]
+}

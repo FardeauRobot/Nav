@@ -20,6 +20,7 @@ import os
 import select
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import shlex
@@ -199,7 +200,8 @@ KEY_SECTIONS: list[tuple[str, list[tuple[str | None, str, str, str]]]] = [
         ("panel_settings", ",", "", "colours, keys, bookmarks"),
     ]),
     ("leaving", [
-        (None, "esc", "", "drop marks, close a panel, else quit"),
+        (None, "^z", "", "undo the last move, cut, copy, rename or new file"),
+        (None, "esc", "", "drop marks, cancel a copy, close a panel, else quit"),
         (None, "q", "", "quit -- always, from anywhere"),
         (None, "^c", "^d", "quit"),
     ]),
@@ -229,7 +231,7 @@ ARROW_KEYS = {"DOWN": "down", "UP": "up", "RIGHT": "enter", "LEFT": "leave"}
 
 # Keys no binding may claim. ENTER/ESC/q/^c/^d are the fixed rows above; the
 # digits are excluded because B and b read one as a bookmark slot.
-RESERVED_KEYS = frozenset({"q", "ESC", "ENTER", "\x03", "\x04"} | set("0123456789"))
+RESERVED_KEYS = frozenset({"q", "ESC", "ENTER", "\x03", "\x04", "\x1a"} | set("0123456789"))
 
 # The keymap joins the config, so DEFAULTS and DEFAULT_CONFIG_TEXT grow a
 # [keys] section -- generated from the table above rather than written out by
@@ -423,6 +425,52 @@ def home_short(p: Path) -> str:
     s = str(p)
     home = str(Path.home())
     return "~" + s[len(home):] if s == home or s.startswith(home + os.sep) else s
+
+
+def human_size(n: int) -> str:
+    size = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024:
+            return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def progress_text(label: str, done: int, total: int, in_bytes: bool,
+                  name: str, width: int) -> str:
+    """The hint line during a copy/delete, as plain text no wider than
+    `width`. Plain, not styled: _hint_line() slices self.message by len(),
+    which would cut an escape sequence in half. The numbers are the part that
+    must survive a narrow terminal, so the name goes first (elided from the
+    LEFT, try_op()'s rule), then the bar shrinks, then disappears. The bar is
+    `#`/`-`: one column under len() everywhere, unlike the block glyphs.
+    total == 0 is the counting pass that runs before the bar can mean
+    anything."""
+    if total <= 0:
+        unit = human_size(done) if in_bytes else f"{done} items"
+        return f"{label} -- counting… {unit}"[:max(0, width)]
+    frac = min(1.0, done / total)
+    if in_bytes:
+        counts = f"{human_size(min(done, total))}/{human_size(total)}"
+    else:
+        counts = f"{min(done, total)}/{total}"
+    head, nums = f"{label} ", f" {int(frac * 100):3d}% {counts}"
+    room = width - len(head) - len(nums)
+    bar_w = min(30, room - 2)
+    if bar_w < 6:
+        return (head + nums.lstrip())[:max(0, width)]
+    left = room - (bar_w + 2)
+    if name and left < len(name) + 2:
+        # Give the name some of the bar back, but never below 10 cells.
+        bar_w = max(min(bar_w, 10), room - 2 - (len(name) + 2))
+        left = room - (bar_w + 2)
+    filled = int(frac * bar_w)
+    text = f"{head}[{'#' * filled}{'-' * (bar_w - filled)}]{nums}"
+    if name and left > 4:
+        if len(name) + 2 > left:
+            name = "…" + name[-(left - 3):]
+        text += "  " + name
+    return text
 
 
 # Variation selectors and the ZWJ: they steer the glyph before them rather
@@ -1197,7 +1245,7 @@ class Screen:
 
     def __enter__(self) -> "Screen":
         self.saved = termios.tcgetattr(self.fd)
-        tty.setcbreak(self.fd)
+        self._cbreak()
         sys.stdout.write("\x1b[?1049h\x1b[?25l")
         sys.stdout.flush()
         for sig in (signal.SIGTERM, signal.SIGHUP):
@@ -1227,6 +1275,21 @@ class Screen:
 
     def __exit__(self, *exc) -> None:
         self.restore()
+
+    def _cbreak(self) -> None:
+        """cbreak keeps ISIG, so ^z would send SIGTSTP and stop the process
+        with the terminal still on the alt screen. Disabling VSUSP alone
+        turns it into a plain \\x1a byte -- undo -- while ^c keeps raising
+        KeyboardInterrupt. The "disabled" value is PC_VDISABLE (0xff on
+        macOS, 0 on Linux), never a hardcoded 0. suspend() restores `saved`,
+        so a foreground nvim still gets its ^z."""
+        tty.setcbreak(self.fd)
+        try:
+            attrs = termios.tcgetattr(self.fd)
+            attrs[6][termios.VSUSP] = bytes([os.fpathconf(self.fd, "PC_VDISABLE")])
+            termios.tcsetattr(self.fd, termios.TCSANOW, attrs)
+        except (OSError, ValueError, termios.error):
+            pass  # ^z suspends, as before -- never a reason for no browser
 
     def restore(self) -> None:
         sys.stdout.write("\x1b[?25h\x1b[?1049l" + RESET)
@@ -1261,7 +1324,7 @@ class Screen:
         discards whatever the child's own exit left queued -- undrained, a
         stray keystroke decodes through key() as a real key and, with
         nothing marked, can quit the browser outright."""
-        tty.setcbreak(self.fd)
+        self._cbreak()
         termios.tcflush(self.fd, termios.TCIFLUSH)
         sys.stdout.write("\x1b[?1049h\x1b[?25l")
         sys.stdout.flush()
@@ -1349,6 +1412,189 @@ class Screen:
             return None
 
 
+class CopyCancelled(Exception):
+    """Esc during a copy. Deliberately not an OSError/shutil.Error: copytree
+    catches those per entry, keeps going and raises a combined error at the
+    very end -- a cancel has to escape the tree walk at once."""
+
+
+class Progress:
+    """Live feedback for a copy/delete, which used to freeze the frame until
+    it finished. Synchronous on purpose: the work runs on the main thread and
+    calls tick() as it goes, which repaints the hint line through the normal
+    frame()/paint() path -- one paint path, same as a panel. Throttled to
+    ~10Hz, because a tree of tiny files would otherwise spend its time
+    painting. measure() on every paint so a resize mid-copy still takes."""
+
+    INTERVAL = 0.1
+
+    def __init__(self, app: "Navigateur", screen: Screen, label: str,
+                 in_bytes: bool, cancellable: bool = False) -> None:
+        self.app, self.screen = app, screen
+        self.label, self.in_bytes = label, in_bytes
+        # Opt-in: only do_copy() can roll its work back and catches
+        # CopyCancelled. A delete has nothing to restore, and try_delete()
+        # catches OSError only -- a cancel raised there would quit the browser.
+        self.cancellable = cancellable
+        self.done = self.total = 0
+        self.name = ""
+        self.last = 0.0
+
+    def start(self, total: int) -> None:
+        """End the counting pass: from here on `done` counts the real work."""
+        self.done, self.total, self.name = 0, total, ""
+        self.tick(0, force=True)
+
+    def tick(self, n: int = 1, name: str | None = None,
+             force: bool = False) -> None:
+        self.done += n
+        if name is not None:
+            self.name = name
+        now = time.monotonic()
+        if not force and now - self.last < self.INTERVAL:
+            return
+        self.last = now
+        if self.cancellable:
+            # Polled at the repaint rate, outside the try below so it cannot
+            # be swallowed. key(0) never blocks and already tells a bare Esc
+            # from an arrow; any other key is dropped, as finish() would.
+            while True:
+                k = self.screen.key(0)
+                if k is None:
+                    break
+                if k == "ESC":
+                    raise CopyCancelled
+        label = self.label + (" (esc cancels)" if self.cancellable else "")
+        # The caller's `except OSError` is about the disk: a repaint that
+        # failed must never abort a half-done delete and get blamed on it.
+        try:
+            cols, height = self.screen.measure()
+            self.app.message = progress_text(label, self.done, self.total,
+                                             self.in_bytes, self.name, cols - 3)
+            self.screen.paint(self.app.frame(cols, height))
+        except Exception:
+            pass
+
+    def finish(self) -> None:
+        """Drop whatever was typed while the bar ran -- resume()'s reason:
+        a key pressed blind against a tree that has since changed (an Esc
+        during a delete, say, which with the marks cleared would quit)
+        must not replay once the work is done. A copy reads Esc itself."""
+        try:
+            termios.tcflush(self.screen.fd, termios.TCIFLUSH)
+        except (OSError, ValueError, termios.error, AttributeError):
+            pass
+
+    def count(self, paths: list[Path]) -> int:
+        """Walk the batch for its size (bytes, or entries for a delete),
+        ticking as it goes so a big tree is not a second freeze. Never
+        follows a symlinked folder -- a copy does dereference those, so its
+        bar can finish early; progress_text() clamps rather than overshoot."""
+        self.done, self.total = 0, 0
+        self.tick(0, force=True)
+        for p in paths:
+            if p.is_dir() and not p.is_symlink():
+                for root, dirs, files in os.walk(p):
+                    if self.in_bytes:
+                        for f in files:
+                            try:
+                                self.tick(os.stat(os.path.join(root, f)).st_size)
+                            except OSError:
+                                pass
+                    else:
+                        self.tick(len(files) + len(dirs))
+                if not self.in_bytes:
+                    self.tick(1)  # the folder itself
+            elif self.in_bytes:
+                try:
+                    self.tick(p.stat().st_size)
+                except OSError:
+                    pass
+            else:
+                self.tick(1)
+        return self.done
+
+
+COPY_CHUNK = 1 << 20      # 1 MiB between ticks inside one big file
+CHUNKED_FROM = 8 << 20    # below this, plain copy2 keeps macOS's fcopyfile path
+
+
+def copy_with_progress(src: str, dst: str, prog: Progress) -> str:
+    """shutil.copy2, but ticking as it goes -- copytree's copy_function and
+    do_copy()'s single-file case both land here. A small file is handed to
+    copy2 whole and ticks once; only a big regular file is chunked, so a
+    4 GB file does not sit at 0% for the whole copy. The chunked path keeps
+    copy2's semantics (dereference the source, copystat after), and opens the
+    target with "xb": the preflight already says it doesn't exist, and this
+    makes "never silently replace" true here even if that ever drifts."""
+    if os.path.isdir(dst):
+        dst = os.path.join(dst, os.path.basename(src))
+    name = os.path.basename(src)
+    st = os.stat(src)
+    if st.st_size < CHUNKED_FROM or not stat.S_ISREG(st.st_mode):
+        shutil.copy2(src, dst)
+        prog.tick(st.st_size, name)
+        return dst
+    with open(src, "rb") as fin, open(dst, "xb") as fout:
+        # "xb" means this file is ours, so a failure -- or a ctrl-c while
+        # watching the bar -- can safely take it back: a truncated file under
+        # the real name would block the retry with "already exists".
+        try:
+            while True:
+                buf = fin.read(COPY_CHUNK)
+                if not buf:
+                    break
+                fout.write(buf)
+                prog.tick(len(buf), name)
+        except BaseException:
+            fout.close()
+            os.unlink(dst)
+            raise
+    shutil.copystat(src, dst)
+    return dst
+
+
+def remove_with_progress(p: Path, prog: Progress) -> None:
+    """shutil.rmtree, but one entry at a time so it can tick -- rmtree has no
+    per-file hook. Bottom-up, never following a link: os.walk with
+    followlinks=False does not descend a symlinked folder, but it still LISTS
+    one in `dirs`, where rmdir would fail -- so anything that is a link gets
+    unlink()ed whichever list it shows up in (rm semantics, the target is
+    never touched). An unreadable subfolder raises instead of being silently
+    skipped, so the failure is reported rather than left as a mystery
+    "directory not empty" on the final rmdir."""
+    def fail(exc: OSError) -> None:
+        raise exc
+
+    for root, dirs, files in os.walk(p, topdown=False, onerror=fail):
+        for name in files:
+            os.unlink(os.path.join(root, name))
+            prog.tick(1, name)
+        for name in dirs:
+            path = os.path.join(root, name)
+            if os.path.islink(path):
+                os.unlink(path)
+            else:
+                os.rmdir(path)
+            prog.tick(1, name)
+    os.rmdir(p)
+    prog.tick(1, p.name)
+
+
+def remove_path(p: Path) -> bool:
+    """Take back something nav itself created -- a cancelled copy's leftovers.
+    rm semantics (a link goes, never its target); a path already gone counts
+    as removed. False only when something is still there afterwards."""
+    try:
+        if p.is_dir() and not p.is_symlink():
+            shutil.rmtree(p)
+        elif os.path.lexists(p):
+            p.unlink()
+    except OSError:
+        pass
+    return not os.path.lexists(p)
+
+
 # -------------------------------------------------------------------------- app
 
 
@@ -1366,6 +1612,10 @@ class Navigateur:
         self.colors = cfg["colors"]
         self.show_hidden = bool(cfg["behavior"]["show_hidden"])
         self.expanded: set[str] = set()
+        # ^z's history, newest last, this process only: ("move", [(now, was)])
+        # for move/cut/rename, ("copy" | "new", [paths created]), and a bare
+        # ("delete", []) so ^z says it can't rather than skipping past it.
+        self.undo: list[tuple[str, list]] = []
         self.marked: set[str] = set()  # the only move/copy/cut/delete state:
         # a free-standing selection. A verb key (m/c/x/d) consumes it; the verb
         # itself lives only for that one keypress, passed as a parameter.
@@ -1856,7 +2106,7 @@ class Navigateur:
             self.open_it()
 
     def _run_viewer(self, screen: Screen, path: Path) -> None:
-        """A PDF in lecteur (~/PDFinTerminal), on the same suspend/resume loan
+        """A PDF in lecteur (~/.dotfiles/lecteur), on the same suspend/resume loan
         _run_editor() takes. Looked up on $PATH, then in ~/.cargo/bin -- where
         `cargo install` puts it, and which is not on $PATH on this Mac. Not
         installed means open_it(), so `↵` on a PDF never becomes a dead key.
@@ -2031,6 +2281,7 @@ class Navigateur:
         except OSError as exc:
             self.message = f"could not create '{name}': {exc}"
             return
+        self.undo.append(("new", [target]))
         self.open_node(dest)  # must run before rebuild(), or a new file
         self.rebuild()        # inside a still-collapsed folder never shows
         self.select_path(target)
@@ -2086,6 +2337,7 @@ class Navigateur:
         except OSError as exc:
             self.message = f"could not rename: {exc}"
             return
+        self.undo.append(("move", [(target, old)]))
         self.rebuild()
         self.select_path(target)
         self.message = f"renamed to {new}"
@@ -2193,7 +2445,7 @@ class Navigateur:
             self.message = f"{verb} cancelled -- marks kept"
             return
         if verb == "copy":
-            self.do_copy(dest, batch)
+            self.do_copy(dest, batch, screen)
         else:
             self.do_move(dest, batch, verb)
 
@@ -2208,44 +2460,173 @@ class Navigateur:
         collision preflight already checked for."""
         action = "moved" if verb == "move" else "cut"
         moved = 0
+        done: list[tuple[Path, Path]] = []  # (where it is now, where it was)
         for p in batch:
             try:
-                shutil.move(str(p), str(dest))
+                done.append((Path(shutil.move(str(p), str(dest))), p))
             except (OSError, shutil.Error) as exc:
                 self.message = f"{action} {moved} of {len(batch)} -- failed on {p.name}: {exc}"
                 break
             moved += 1
         else:
             self.message = f"{action} {moved} item{'s' if moved != 1 else ''} to {home_short(dest)}"
+        if done:
+            self.undo.append(("move", done))
         self.marked.clear()
         self.open_node(dest)
         self.rebuild()
         self.select_path(dest)
 
-    def do_copy(self, dest: Path, batch: list[Path]) -> None:
+    def do_copy(self, dest: Path, batch: list[Path], screen: Screen) -> None:
         """The copies themselves. Unlike shutil.move, shutil.copytree refuses
         an existing target directory rather than merging into it -- the
         collision preflight already guarantees dest/name doesn't exist, so
         that refusal never fires here, but it does mean a directory needs the
         name joined explicitly rather than handed the bare dest the way
-        shutil.copy2 (file case) accepts."""
+        copy_with_progress() (file case, copy2's convention) accepts.
+
+        Progress is in bytes, counted after the `y` so the prompt itself
+        stays instant; every file, in a tree or alone, goes through
+        copy_with_progress()."""
+        prog = Progress(self, screen, "copying", in_bytes=True, cancellable=True)
         copied = 0
-        for p in batch:
-            try:
-                if p.is_dir():
-                    shutil.copytree(str(p), str(dest / p.name))
-                else:
-                    shutil.copy2(str(p), str(dest))
-            except (OSError, shutil.Error) as exc:
-                self.message = f"copied {copied} of {len(batch)} -- failed on {p.name}: {exc}"
-                break
-            copied += 1
-        else:
-            self.message = f"copied {copied} item{'s' if copied != 1 else ''} to {home_short(dest)}"
+        try:
+            prog.start(prog.count(batch))
+            for p in batch:
+                try:
+                    if p.is_dir():
+                        shutil.copytree(str(p), str(dest / p.name),
+                                        copy_function=lambda s, d: copy_with_progress(s, d, prog))
+                    else:
+                        copy_with_progress(str(p), str(dest), prog)
+                except (OSError, shutil.Error) as exc:
+                    self.message = f"copied {copied} of {len(batch)} -- failed on {p.name}: {exc}"
+                    break
+                copied += 1
+            else:
+                self.message = f"copied {copied} item{'s' if copied != 1 else ''} to {home_short(dest)}"
+        except CopyCancelled:
+            # Esc takes the whole batch back, the finished items included:
+            # left behind, they would trip _op_batch()'s collision preflight
+            # on the retry. Everything at dest/<name> for these items is ours
+            # -- the preflight said none of it existed before the `y`.
+            self.message = "copy cancelled -- cleaning up…"
+            screen.paint(self.frame(*screen.measure()))
+            left = [q.name for q in batch[:copied + 1]
+                    if not remove_path(dest / q.name)]
+            prog.finish()
+            self.message = ("copy cancelled -- marks kept" if not left else
+                            f"copy cancelled -- could not remove {', '.join(left)}")
+            self.rebuild()
+            return
+        prog.finish()
+        if copied:
+            self.undo.append(("copy", [dest / q.name for q in batch[:copied]]))
         self.marked.clear()
         self.open_node(dest)
         self.rebuild()
         self.select_path(dest)
+
+    def undo_last(self, screen: Screen, cols: int, height: int) -> bool:
+        """^z -- take back the newest entry of self.undo. Each kind is
+        prechecked whole before anything is touched, the same all-or-nothing
+        rule as _op_batch(): a refusal leaves the entry on the stack and the
+        disk as it was. Moves go back without asking (moving again redoes
+        them); undoing a copy deletes, so it asks `y` first -- the copies may
+        have been edited since. A new file goes only while still empty.
+        Returns True only for ctrl-c/ctrl-d inside that confirm."""
+        if not self.undo:
+            self.message = "nothing to undo"
+            return False
+        kind, items = self.undo[-1]
+        if kind == "delete":
+            # Popped, so the next ^z reaches the operation before it.
+            self.undo.pop()
+            self.message = "a delete can't be undone -- ^z again for the one before"
+            return False
+        if kind == "move":
+            for now, was in items:
+                if not os.path.lexists(now):
+                    return self._no(f"can't undo: {now.name} is no longer at {home_short(now.parent)}")
+                if os.path.lexists(was):
+                    return self._no(f"can't undo: '{was.name}' already exists in {home_short(was.parent)}")
+                if not was.parent.is_dir():
+                    return self._no(f"can't undo: {home_short(was.parent)} is gone")
+            back = 0
+            for now, was in reversed(items):
+                try:
+                    shutil.move(str(now), str(was))
+                except (OSError, shutil.Error) as exc:
+                    self.message = f"undid {back} of {len(items)} -- failed on {now.name}: {exc}"
+                    # What did go back is no longer on the stack's books.
+                    self.undo[-1] = (kind, items[:len(items) - back])
+                    self.rebuild()
+                    return False
+                back += 1
+            self.undo.pop()
+            self.message = (f"undone -- {items[0][1].name} is back" if len(items) == 1
+                            else f"undone -- {len(items)} items are back")
+            self.open_node(items[0][1].parent)
+            self.rebuild()
+            self.select_path(items[0][1])
+            return False
+        if kind == "new":
+            p = items[0]
+            try:
+                st = p.lstat()
+            except OSError:
+                self.undo.pop()
+                return self._no(f"{p.name} is already gone")
+            if not stat.S_ISREG(st.st_mode) or st.st_size:
+                return self._no(f"can't undo: {p.name} is no longer empty")
+            try:
+                p.unlink()
+            except OSError as exc:
+                return self._no(f"could not remove {p.name}: {exc}")
+            self.undo.pop()
+            self.message = f"undone -- removed {p.name}"
+            self.rebuild()
+            return False
+        # copy: the one undo that destroys data, so it asks first.
+        alive = [p for p in items if os.path.lexists(p)]
+        if not alive:
+            self.undo.pop()
+            return self._no("the copies are already gone")
+        tail = " -- y to confirm"
+        lead = f"undo copy: delete {len(alive)} cop{'ies' if len(alive) > 1 else 'y'} in "
+        where = home_short(alive[0].parent)
+        budget = max(0, cols - 3)
+        if len(lead) + len(where) + len(tail) > budget:
+            room = budget - len(lead) - len(tail)
+            where = "…" + where[-(room - 1):] if room > 1 else ""
+        reply = self.read_slot(screen, cols, height, f"{lead}{where}{tail}")
+        if reply in ("\x03", "\x04"):
+            return True
+        if reply != "y":
+            self.message = "undo cancelled"
+            return False
+        gone = 0
+        for p in alive:
+            try:
+                if p.is_dir() and not p.is_symlink():
+                    prog = Progress(self, screen, "undoing copy", in_bytes=False)
+                    prog.start(prog.count([p]))
+                    try:
+                        remove_with_progress(p, prog)
+                    finally:
+                        prog.finish()
+                else:
+                    p.unlink()
+            except OSError as exc:
+                self.message = f"removed {gone} of {len(alive)} copies -- failed on {p.name}: {exc}"
+                self.undo[-1] = (kind, [q for q in items if os.path.lexists(q)])
+                self.rebuild()
+                return False
+            gone += 1
+        self.undo.pop()
+        self.message = f"undone -- removed {gone} cop{'ies' if gone > 1 else 'y'}"
+        self.rebuild()
+        return False
 
     def _delete_batch(self) -> list[Path]:
         """The marked set, reduced to what actually needs deleting: nested
@@ -2277,7 +2658,7 @@ class Navigateur:
             return
         deleted = 0
         auto = False
-        for p in batch:
+        for i, p in enumerate(batch, 1):
             if not auto:
                 tail = " -- y/N, Y for all"
                 lead = "delete "
@@ -2306,7 +2687,17 @@ class Navigateur:
                     return
             try:
                 if p.is_dir() and not p.is_symlink():
-                    shutil.rmtree(str(p))
+                    # Counted per item, once it is confirmed -- counting the
+                    # whole batch up front would make every y/N prompt wait.
+                    label = f"deleting {i}/{len(batch)}" if len(batch) > 1 else "deleting"
+                    prog = Progress(self, screen, label, in_bytes=False)
+                    prog.start(prog.count([p]))
+                    try:
+                        remove_with_progress(p, prog)
+                    finally:
+                        # Before the next item's y/N: a key typed during
+                        # this one must not answer that prompt unseen.
+                        prog.finish()
                 else:
                     p.unlink()  # rm semantics: removes a symlink itself, never its target
             except (OSError, shutil.Error) as exc:
@@ -2315,6 +2706,8 @@ class Navigateur:
                 self.rebuild()
                 return
             deleted += 1
+            if deleted == 1:
+                self.undo.append(("delete", []))
         self.message = f"deleted {deleted} item{'s' if deleted != 1 else ''}"
         self.marked.clear()
         self.rebuild()
@@ -3099,6 +3492,9 @@ class Navigateur:
                 else:
                     self.chosen = self.published_dir()
                     return
+            elif key == "\x1a":  # ctrl-z, freed from SIGTSTP by Screen._cbreak()
+                if self.undo_last(screen, cols, height):
+                    return  # ctrl-c / ctrl-d from inside its confirm
             elif action == "down":
                 self.move(count)
             elif action == "up":
